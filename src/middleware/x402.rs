@@ -118,6 +118,13 @@ where
                 return Ok(res.map_into_left_body());
             }
 
+            // Free endpoint (cost == "0"): skip payment
+            if payment_config.cost == "0" {
+                debug!("Free endpoint, skipping x402 payment");
+                let res = service.call(req).await?;
+                return Ok(res.map_into_left_body());
+            }
+
             let resource = req.path().to_string();
 
             let payment_header = req
