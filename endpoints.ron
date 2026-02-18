@@ -31,7 +31,7 @@
     (
       name: "MiniMax-M2.5",
       route_prefix: "/minimax",
-      api_endpoint: "https://api.minimax.chat/v1/text/chatcompletion_v2",
+      api_endpoint: "https://api.minimax.chat/v1/chat/completions",
       api_key_env: "MINIMAX_API_KEY",
       model: "minimax-m2.5",
       archetype: "standard",
