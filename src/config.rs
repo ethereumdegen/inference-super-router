@@ -44,7 +44,7 @@ impl CreditsConfig {
         }
 
         let api_url = env::var("CREDITS_API_URL")
-            .unwrap_or_else(|_| "https://starkbot.cloud".to_string());
+            .unwrap_or_else(|_| "https://starkbot.cloud/api".to_string());
 
         let chain_id: u64 = env::var("CREDITS_CHAIN_ID")
             .ok()

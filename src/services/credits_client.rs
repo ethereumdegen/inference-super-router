@@ -71,7 +71,13 @@ impl CreditsClient {
 
         // Parse response: expect {"credits": N} or just a number
         let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| format!("Invalid credits JSON: {}", e))?;
+            .map_err(|e| {
+                error!(
+                    "[CREDITS_CLIENT] Invalid JSON from credits API: error={}, url={}, body_preview={}",
+                    e, url, &body[..body.len().min(200)]
+                );
+                format!("Invalid credits JSON: {}", e)
+            })?;
 
         let credits = json
             .get("credits")
