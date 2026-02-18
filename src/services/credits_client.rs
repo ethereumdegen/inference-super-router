@@ -26,16 +26,17 @@ impl CreditsClient {
     /// Get credit balance for a wallet address.
     /// Returns the number of credits, or an error.
     pub async fn get_credits(&self, wallet_address: &str) -> Result<i64, String> {
-        let path = "/admin/credits";
+        let route = "/admin/credits";
         let query = format!("address={}", wallet_address);
-        let url = format!("{}{}?{}", self.base_url, path, query);
+        let url = format!("{}{}?{}", self.base_url, route, query);
 
-        // Parse authority from base_url
+        // Sign with the full path as seen by the server (path_prefix + route)
         let authority = extract_authority(&self.base_url);
+        let signing_path = format!("{}{}", extract_path_prefix(&self.base_url), route);
 
         let signed = self
             .signer
-            .sign_request("GET", &authority, path, Some(&query), None)
+            .sign_request("GET", &authority, &signing_path, Some(&query), None)
             .map_err(|e| format!("Failed to sign credits request: {}", e))?;
 
         let mut req = self.http.get(&url);
@@ -81,8 +82,8 @@ impl CreditsClient {
         wallet_address: &str,
         delta: i64,
     ) -> Result<i64, String> {
-        let path = "/admin/credits";
-        let url = format!("{}{}", self.base_url, path);
+        let route = "/admin/credits";
+        let url = format!("{}{}", self.base_url, route);
 
         let body_json = serde_json::json!({
             "address": wallet_address,
@@ -91,11 +92,13 @@ impl CreditsClient {
         let body_bytes = serde_json::to_vec(&body_json)
             .map_err(|e| format!("Failed to serialize credits body: {}", e))?;
 
+        // Sign with the full path as seen by the server (path_prefix + route)
         let authority = extract_authority(&self.base_url);
+        let signing_path = format!("{}{}", extract_path_prefix(&self.base_url), route);
 
         let signed = self
             .signer
-            .sign_request("POST", &authority, path, None, Some(&body_bytes))
+            .sign_request("POST", &authority, &signing_path, None, Some(&body_bytes))
             .map_err(|e| format!("Failed to sign credits request: {}", e))?;
 
         let mut req = self
@@ -151,4 +154,19 @@ fn extract_authority(url: &str) -> String {
         .next()
         .unwrap_or("")
         .to_string()
+}
+
+/// Extract the path prefix from a base URL.
+/// e.g. "https://starkbot.cloud/api" → "/api"
+/// e.g. "https://starkbot.cloud" → ""
+fn extract_path_prefix(url: &str) -> String {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+
+    match without_scheme.find('/') {
+        Some(idx) => without_scheme[idx..].trim_end_matches('/').to_string(),
+        None => String::new(),
+    }
 }
