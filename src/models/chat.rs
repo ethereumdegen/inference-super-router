@@ -99,12 +99,16 @@ pub struct ChatRequest {
     pub tool_choice: Option<Value>,
 }
 
-/// OpenAI-compatible chat response
+/// OpenAI-compatible chat response (lenient deserialization for provider compatibility)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatResponse {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
     pub choices: Vec<ChatChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,6 +117,7 @@ pub struct ChatResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatChoice {
+    #[serde(default)]
     pub index: u32,
     pub message: ResponseMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +127,7 @@ pub struct ChatChoice {
 /// Response message can have tool_calls
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseMessage {
+    #[serde(default = "default_assistant_role")]
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -129,10 +135,17 @@ pub struct ResponseMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
+fn default_assistant_role() -> String {
+    "assistant".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatUsage {
+    #[serde(default)]
     pub prompt_tokens: u32,
+    #[serde(default)]
     pub completion_tokens: u32,
+    #[serde(default)]
     pub total_tokens: u32,
 }
 

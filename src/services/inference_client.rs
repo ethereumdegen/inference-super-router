@@ -84,8 +84,14 @@ impl InferenceClient {
             return Err(AppError::InferenceBackend(format!("API returned {}: {}", status, body)));
         }
 
-        let chat_response: ChatResponse = response.json().await.map_err(|e| {
+        let raw_body = response.text().await.map_err(|e| {
+            error!("Failed to read {} API response body: {}", self.archetype, e);
+            AppError::InferenceBackend(format!("Failed to read response: {}", e))
+        })?;
+
+        let chat_response: ChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
             error!("Failed to parse {} API response: {}", self.archetype, e);
+            error!("Raw response body: {}", &raw_body[..raw_body.len().min(2000)]);
             AppError::InferenceBackend(format!("Invalid response: {}", e))
         })?;
 
