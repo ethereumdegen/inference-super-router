@@ -1,3 +1,4 @@
+pub mod credits_client;
 pub mod facilitator;
 pub mod inference_client;
 pub mod nonce_tracker;
@@ -7,6 +8,7 @@ pub mod settlement_store;
 pub mod settlement_worker;
 pub mod verification_cache;
 
+pub use credits_client::CreditsClient;
 pub use facilitator::FacilitatorClient;
 pub use inference_client::InferenceClient;
 pub use nonce_tracker::NonceTracker;

@@ -111,292 +111,392 @@ where
         let verification_cache = self.verification_cache.clone();
 
         Box::pin(async move {
-            // TEST_MODE: skip payment entirely
-            if global_config.test_mode {
-                debug!("TEST_MODE: skipping x402 payment");
-                let res = service.call(req).await?;
-                return Ok(res.map_into_left_body());
-            }
+            handle_x402_payment(
+                req,
+                service,
+                &global_config,
+                &payment_config,
+                &facilitator,
+                &nonce_tracker,
+                &settlement_queue,
+                &rate_limiter,
+                &verification_cache,
+                None, // no extra headers
+            )
+            .await
+        })
+    }
+}
 
-            // Free endpoint (cost == "0"): skip payment
-            if payment_config.cost == "0" {
-                debug!("Free endpoint, skipping x402 payment");
-                let res = service.call(req).await?;
-                return Ok(res.map_into_left_body());
-            }
+/// Core x402 payment verification and settlement logic.
+///
+/// Shared between `X402MiddlewareService` and `CreditsOrX402MiddlewareService`.
+/// `extra_402_headers` allows the caller to inject additional headers into 402 responses
+/// (e.g. `x-erc8128-credits: true` for credits-enabled endpoints).
+pub(crate) async fn handle_x402_payment<S, B>(
+    req: ServiceRequest,
+    service: Arc<S>,
+    global_config: &GlobalConfig,
+    payment_config: &EndpointPaymentConfig,
+    facilitator: &FacilitatorClient,
+    nonce_tracker: &NonceTracker,
+    settlement_queue: &SettlementQueue,
+    rate_limiter: &RateLimiter,
+    verification_cache: &VerificationCache,
+    extra_402_headers: Option<&[(&str, &str)]>,
+) -> Result<ServiceResponse<EitherBody<B>>, Error>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    S::Future: 'static,
+    B: 'static,
+{
+    // TEST_MODE: skip payment entirely
+    if global_config.test_mode {
+        debug!("TEST_MODE: skipping x402 payment");
+        let res = service.call(req).await?;
+        return Ok(res.map_into_left_body());
+    }
 
-            let resource = req.path().to_string();
+    // Free endpoint (cost == "0"): skip payment
+    if payment_config.cost == "0" {
+        debug!("Free endpoint, skipping x402 payment");
+        let res = service.call(req).await?;
+        return Ok(res.map_into_left_body());
+    }
 
-            let payment_header = req
-                .headers()
-                .get(X_PAYMENT_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
+    let resource = req.path().to_string();
 
-            match payment_header {
-                None => {
-                    // No payment header — return 402
-                    info!("No payment header, returning 402 for {}", resource);
+    let payment_header = req
+        .headers()
+        .get(X_PAYMENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
-                    if payment_config.is_v2() {
-                        // v2: base64-encoded header
-                        let encoded = match payment_config.build_402_header(&resource) {
-                            Some(e) => e,
-                            None => {
-                                let response = HttpResponse::InternalServerError()
-                                    .body("Failed to generate payment requirements");
-                                return Ok(req.into_response(response).map_into_right_body());
-                            }
-                        };
+    match payment_header {
+        None => {
+            // No payment header — return 402
+            info!("No payment header, returning 402 for {}", resource);
 
-                        let response = HttpResponse::PaymentRequired()
-                            .insert_header((
-                                HeaderName::from_static("payment-required"),
-                                HeaderValue::from_str(&encoded)
-                                    .unwrap_or_else(|_| HeaderValue::from_static("")),
-                            ))
-                            .body("Payment required. See payment-required header for details.");
+            if payment_config.is_v2() {
+                // v2: base64-encoded header
+                let encoded = match payment_config.build_402_header(&resource) {
+                    Some(e) => e,
+                    None => {
+                        let response = HttpResponse::InternalServerError()
+                            .body("Failed to generate payment requirements");
+                        return Ok(req.into_response(response).map_into_right_body());
+                    }
+                };
 
-                        Ok(req.into_response(response).map_into_right_body())
-                    } else {
-                        // v1: JSON body with token metadata
-                        let body = payment_config.build_402_body(&resource);
-                        let response = HttpResponse::PaymentRequired()
-                            .content_type("application/json")
-                            .json(body);
-                        Ok(req.into_response(response).map_into_right_body())
+                let mut builder = HttpResponse::PaymentRequired();
+                builder.insert_header((
+                    HeaderName::from_static("payment-required"),
+                    HeaderValue::from_str(&encoded)
+                        .unwrap_or_else(|_| HeaderValue::from_static("")),
+                ));
+
+                // Inject extra headers (e.g. x-erc8128-credits)
+                if let Some(headers) = extra_402_headers {
+                    for (name, value) in headers {
+                        if let (Ok(hn), Ok(hv)) = (
+                            HeaderName::from_bytes(name.as_bytes()),
+                            HeaderValue::from_str(value),
+                        ) {
+                            builder.insert_header((hn, hv));
+                        }
                     }
                 }
-                Some(payment_header_value) => {
-                    debug!("Payment header present, verifying...");
 
-                    // Decode payment payload
-                    let raw_payload: serde_json::Value = match base64::engine::general_purpose::STANDARD
-                        .decode(&payment_header_value)
-                    {
-                        Ok(bytes) => match serde_json::from_slice(&bytes) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!("Invalid payment JSON: {}", e);
-                                let response = HttpResponse::PaymentRequired()
-                                    .body(format!("Invalid payment JSON: {}", e));
-                                return Ok(req.into_response(response).map_into_right_body());
-                            }
-                        },
-                        Err(e) => {
-                            warn!("Invalid payment base64: {}", e);
-                            let response = HttpResponse::PaymentRequired()
-                                .body(format!("Invalid payment encoding: {}", e));
-                            return Ok(req.into_response(response).map_into_right_body());
-                        }
-                    };
+                let response = builder
+                    .body("Payment required. See payment-required header for details.");
+                Ok(req.into_response(response).map_into_right_body())
+            } else {
+                // v1: JSON body with token metadata
+                let body = payment_config.build_402_body(&resource);
+                let mut builder = HttpResponse::PaymentRequired();
 
-                    // Extract payer and nonce (reliable for v2, best-effort for v1)
-                    let payer_address = payment_config.extract_payer(&raw_payload);
-                    let nonce = payment_config.extract_nonce(&raw_payload);
-
-                    // For v2: enforce rate limiting and nonce protection
-                    if payment_config.is_v2() {
-                        if let Some(ref payer) = payer_address {
-                            if !rate_limiter.check_rate_limit(payer) {
-                                warn!("Rate limit exceeded for address: {}", payer);
-                                let response = HttpResponse::TooManyRequests()
-                                    .insert_header(("Retry-After", "1"))
-                                    .body("Rate limit exceeded: maximum 5 requests per second per address");
-                                return Ok(req.into_response(response).map_into_right_body());
-                            }
-                        }
-
-                        if let Some(ref nonce_val) = nonce {
-                            if !nonce_tracker.try_use_nonce(nonce_val) {
-                                warn!("Replay attack detected! Nonce already used: {}", nonce_val);
-                                let response = HttpResponse::PaymentRequired()
-                                    .body("Payment rejected: nonce already used");
-                                return Ok(req.into_response(response).map_into_right_body());
-                            }
+                if let Some(headers) = extra_402_headers {
+                    for (name, value) in headers {
+                        if let (Ok(hn), Ok(hv)) = (
+                            HeaderName::from_bytes(name.as_bytes()),
+                            HeaderValue::from_str(value),
+                        ) {
+                            builder.insert_header((hn, hv));
                         }
                     }
+                }
 
-                    // Build verify request
-                    let verify_request = payment_config.build_verify_request(&raw_payload, &resource);
+                let response = builder.content_type("application/json").json(body);
+                Ok(req.into_response(response).map_into_right_body())
+            }
+        }
+        Some(payment_header_value) => {
+            debug!("Payment header present, verifying...");
 
-                    // Settlement nonce: use extracted nonce or generate a unique one
-                    let settlement_nonce = nonce.unwrap_or_else(|| {
-                        format!("gen-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0))
-                    });
+            // Decode payment payload
+            let raw_payload: serde_json::Value =
+                match base64::engine::general_purpose::STANDARD.decode(&payment_header_value) {
+                    Ok(bytes) => match serde_json::from_slice(&bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Invalid payment JSON: {}", e);
+                            let response = HttpResponse::PaymentRequired()
+                                .body(format!("Invalid payment JSON: {}", e));
+                            return Ok(req.into_response(response).map_into_right_body());
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Invalid payment base64: {}", e);
+                        let response = HttpResponse::PaymentRequired()
+                            .body(format!("Invalid payment encoding: {}", e));
+                        return Ok(req.into_response(response).map_into_right_body());
+                    }
+                };
 
-                    // Build settle request for queueing
-                    let settle_request = payment_config.build_settle_request(&raw_payload, &resource);
+            // Extract payer and nonce (reliable for v2, best-effort for v1)
+            let payer_address = payment_config.extract_payer(&raw_payload);
+            let nonce = payment_config.extract_nonce(&raw_payload);
 
-                    // For v1 (Starkbot) where payer extraction is unreliable: always take Path C
-                    // For v2 (USDC): use the three-path architecture
-                    if payment_config.is_v2() {
-                        if let Some(ref payer) = payer_address {
-                            // ── Path A: Cache hit — skip verify ──
-                            if verification_cache.is_verified(payer) {
-                                debug!("Cache hit for payer {}, skipping verify", payer);
+            // For v2: enforce rate limiting and nonce protection
+            if payment_config.is_v2() {
+                if let Some(ref payer) = payer_address {
+                    if !rate_limiter.check_rate_limit(payer) {
+                        warn!("Rate limit exceeded for address: {}", payer);
+                        let response = HttpResponse::TooManyRequests()
+                            .insert_header(("Retry-After", "1"))
+                            .body(
+                                "Rate limit exceeded: maximum 5 requests per second per address",
+                            );
+                        return Ok(req.into_response(response).map_into_right_body());
+                    }
+                }
 
-                                let pending = PendingSettlement::new(settle_request, settlement_nonce.clone());
-                                if let Err(_rejected) = settlement_queue.push(pending).await {
-                                    error!("Settlement queue full, rejecting request");
-                                    let response = HttpResponse::ServiceUnavailable()
-                                        .body("Service temporarily unavailable: settlement queue full");
-                                    return Ok(req.into_response(response).map_into_right_body());
+                if let Some(ref nonce_val) = nonce {
+                    if !nonce_tracker.try_use_nonce(nonce_val) {
+                        warn!("Replay attack detected! Nonce already used: {}", nonce_val);
+                        let response = HttpResponse::PaymentRequired()
+                            .body("Payment rejected: nonce already used");
+                        return Ok(req.into_response(response).map_into_right_body());
+                    }
+                }
+            }
+
+            // Build verify request
+            let verify_request = payment_config.build_verify_request(&raw_payload, &resource);
+
+            // Settlement nonce: use extracted nonce or generate a unique one
+            let settlement_nonce = nonce.unwrap_or_else(|| {
+                format!(
+                    "gen-{}",
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                )
+            });
+
+            // Build settle request for queueing
+            let settle_request = payment_config.build_settle_request(&raw_payload, &resource);
+
+            // For v1 (Starkbot) where payer extraction is unreliable: always take Path C
+            // For v2 (USDC): use the three-path architecture
+            if payment_config.is_v2() {
+                if let Some(ref payer) = payer_address {
+                    // ── Path A: Cache hit — skip verify ──
+                    if verification_cache.is_verified(payer) {
+                        debug!("Cache hit for payer {}, skipping verify", payer);
+
+                        let pending = PendingSettlement::new(
+                            settle_request,
+                            settlement_nonce.clone(),
+                        );
+                        if let Err(_rejected) = settlement_queue.push(pending).await {
+                            error!("Settlement queue full, rejecting request");
+                            let response = HttpResponse::ServiceUnavailable()
+                                .body("Service temporarily unavailable: settlement queue full");
+                            return Ok(req.into_response(response).map_into_right_body());
+                        }
+
+                        let res = service.call(req).await?;
+
+                        let payment_response = make_payment_response_header(true, None);
+                        let (req, response) = res.into_parts();
+                        let mut response = response.map_into_left_body();
+                        if let Ok(hv) = HeaderValue::from_str(&payment_response) {
+                            response.headers_mut().insert(
+                                HeaderName::from_static("payment-response"),
+                                hv,
+                            );
+                        }
+                        return Ok(ServiceResponse::new(req, response));
+                    }
+
+                    // Pre-check queue capacity
+                    if settlement_queue.is_full() {
+                        error!("Settlement queue full, rejecting request early");
+                        let response = HttpResponse::ServiceUnavailable()
+                            .body("Service temporarily unavailable: settlement queue full");
+                        return Ok(req.into_response(response).map_into_right_body());
+                    }
+
+                    // ── Path B: Recent failure — sequential verify ──
+                    if verification_cache.has_recent_failure(payer) {
+                        debug!("Downgrading payer {} to sequential path", payer);
+
+                        let verify_result = facilitator.verify_raw(&verify_request).await;
+
+                        match verify_result {
+                            Ok(vr) if vr.is_valid => {
+                                info!(
+                                    "Payment verified (sequential) for payer: {:?}",
+                                    vr.payer
+                                );
+                                verification_cache.mark_verified(payer);
+
+                                let pending = PendingSettlement::new(
+                                    settle_request,
+                                    settlement_nonce,
+                                );
+                                if let Err(_) = settlement_queue.push(pending).await {
+                                    warn!("Settlement not queued due to full queue");
                                 }
 
                                 let res = service.call(req).await?;
-
-                                let payment_response = make_payment_response_header(true, None);
+                                let payment_response =
+                                    make_payment_response_header(true, None);
                                 let (req, response) = res.into_parts();
                                 let mut response = response.map_into_left_body();
                                 if let Ok(hv) = HeaderValue::from_str(&payment_response) {
                                     response.headers_mut().insert(
-                                        HeaderName::from_static("payment-response"), hv,
+                                        HeaderName::from_static("payment-response"),
+                                        hv,
                                     );
                                 }
                                 return Ok(ServiceResponse::new(req, response));
                             }
+                            Ok(vr) => {
+                                let error_msg = vr.invalid_reason.unwrap_or_else(|| {
+                                    "Payment verification failed".to_string()
+                                });
+                                warn!(
+                                    "Payment verification failed (sequential): {}",
+                                    error_msg
+                                );
+                                verification_cache.record_failure(payer);
 
-                            // Pre-check queue capacity
-                            if settlement_queue.is_full() {
-                                error!("Settlement queue full, rejecting request early");
-                                let response = HttpResponse::ServiceUnavailable()
-                                    .body("Service temporarily unavailable: settlement queue full");
-                                return Ok(req.into_response(response).map_into_right_body());
-                            }
-
-                            // ── Path B: Recent failure — sequential verify ──
-                            if verification_cache.has_recent_failure(payer) {
-                                debug!("Downgrading payer {} to sequential path", payer);
-
-                                let verify_result = facilitator.verify_raw(&verify_request).await;
-
-                                match verify_result {
-                                    Ok(vr) if vr.is_valid => {
-                                        info!("Payment verified (sequential) for payer: {:?}", vr.payer);
-                                        verification_cache.mark_verified(payer);
-
-                                        let pending = PendingSettlement::new(settle_request, settlement_nonce);
-                                        if let Err(_) = settlement_queue.push(pending).await {
-                                            warn!("Settlement not queued due to full queue");
-                                        }
-
-                                        let res = service.call(req).await?;
-                                        let payment_response = make_payment_response_header(true, None);
-                                        let (req, response) = res.into_parts();
-                                        let mut response = response.map_into_left_body();
-                                        if let Ok(hv) = HeaderValue::from_str(&payment_response) {
-                                            response.headers_mut().insert(
-                                                HeaderName::from_static("payment-response"), hv,
-                                            );
-                                        }
-                                        return Ok(ServiceResponse::new(req, response));
-                                    }
-                                    Ok(vr) => {
-                                        let error_msg = vr.invalid_reason.unwrap_or_else(|| "Payment verification failed".to_string());
-                                        warn!("Payment verification failed (sequential): {}", error_msg);
-                                        verification_cache.record_failure(payer);
-
-                                        let payment_response = make_payment_response_header(false, Some(&error_msg));
-                                        let response = HttpResponse::PaymentRequired()
-                                            .insert_header((
-                                                HeaderName::from_static("payment-response"),
-                                                HeaderValue::from_str(&payment_response)
-                                                    .unwrap_or_else(|_| HeaderValue::from_static("")),
-                                            ))
-                                            .body(format!("Payment verification failed: {}", error_msg));
-                                        return Ok(req.into_response(response).map_into_right_body());
-                                    }
-                                    Err(e) => {
-                                        error!("Facilitator error (sequential): {}", e);
-                                        let response = HttpResponse::BadGateway()
-                                            .body(format!("Facilitator error: {}", e));
-                                        return Ok(req.into_response(response).map_into_right_body());
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // ── Path C: Parallel verify + service call ──
-                    // Used for: v2 first-timers, all v1 requests
-                    debug!("Verifying + calling service in parallel");
-
-                    let verify_fut = facilitator.verify_raw(&verify_request);
-                    let service_fut = service.call(req);
-
-                    let (verify_result, service_result) = tokio::join!(verify_fut, service_fut);
-
-                    match verify_result {
-                        Ok(vr) if vr.is_valid => {
-                            info!("Payment verified (parallel) for payer: {:?}", vr.payer);
-
-                            if let Some(ref payer) = payer_address {
-                                verification_cache.mark_verified(payer);
-                            }
-
-                            let pending = PendingSettlement::new(settle_request, settlement_nonce);
-                            if let Err(_) = settlement_queue.push(pending).await {
-                                warn!("Settlement not queued due to full queue");
-                            }
-
-                            let res = service_result?;
-                            let payment_response = make_payment_response_header(true, None);
-
-                            let (req, response) = res.into_parts();
-                            let mut response = response.map_into_left_body();
-                            if let Ok(hv) = HeaderValue::from_str(&payment_response) {
-                                response.headers_mut().insert(
-                                    HeaderName::from_static("payment-response"), hv,
+                                let payment_response =
+                                    make_payment_response_header(false, Some(&error_msg));
+                                let response = HttpResponse::PaymentRequired()
+                                    .insert_header((
+                                        HeaderName::from_static("payment-response"),
+                                        HeaderValue::from_str(&payment_response)
+                                            .unwrap_or_else(|_| HeaderValue::from_static("")),
+                                    ))
+                                    .body(format!(
+                                        "Payment verification failed: {}",
+                                        error_msg
+                                    ));
+                                return Ok(
+                                    req.into_response(response).map_into_right_body()
                                 );
                             }
-                            Ok(ServiceResponse::new(req, response))
-                        }
-                        Ok(vr) => {
-                            let error_msg = vr.invalid_reason.unwrap_or_else(|| "Payment verification failed".to_string());
-                            warn!("Payment verification failed (parallel): {}", error_msg);
-                            if let Some(ref payer) = payer_address {
-                                verification_cache.record_failure(payer);
-                            }
-
-                            let payment_response = make_payment_response_header(false, Some(&error_msg));
-                            let response = HttpResponse::PaymentRequired()
-                                .insert_header((
-                                    HeaderName::from_static("payment-response"),
-                                    HeaderValue::from_str(&payment_response)
-                                        .unwrap_or_else(|_| HeaderValue::from_static("")),
-                                ))
-                                .body(format!("Payment verification failed: {}", error_msg));
-
-                            match service_result {
-                                Ok(res) => {
-                                    let (req, _) = res.into_parts();
-                                    Ok(ServiceResponse::new(req, response.map_into_right_body()))
-                                }
-                                Err(_) => {
-                                    Err(actix_web::error::ErrorPaymentRequired(error_msg))
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Facilitator error (parallel): {}", e);
-                            let response = HttpResponse::BadGateway()
-                                .body(format!("Facilitator error: {}", e));
-
-                            match service_result {
-                                Ok(res) => {
-                                    let (req, _) = res.into_parts();
-                                    Ok(ServiceResponse::new(req, response.map_into_right_body()))
-                                }
-                                Err(_) => {
-                                    Err(actix_web::error::ErrorBadGateway(format!("Facilitator error: {}", e)))
-                                }
+                            Err(e) => {
+                                error!("Facilitator error (sequential): {}", e);
+                                let response = HttpResponse::BadGateway()
+                                    .body(format!("Facilitator error: {}", e));
+                                return Ok(
+                                    req.into_response(response).map_into_right_body()
+                                );
                             }
                         }
                     }
                 }
             }
-        })
+
+            // ── Path C: Parallel verify + service call ──
+            // Used for: v2 first-timers, all v1 requests
+            debug!("Verifying + calling service in parallel");
+
+            let verify_fut = facilitator.verify_raw(&verify_request);
+            let service_fut = service.call(req);
+
+            let (verify_result, service_result) = tokio::join!(verify_fut, service_fut);
+
+            match verify_result {
+                Ok(vr) if vr.is_valid => {
+                    info!("Payment verified (parallel) for payer: {:?}", vr.payer);
+
+                    if let Some(ref payer) = payer_address {
+                        verification_cache.mark_verified(payer);
+                    }
+
+                    let pending =
+                        PendingSettlement::new(settle_request, settlement_nonce);
+                    if let Err(_) = settlement_queue.push(pending).await {
+                        warn!("Settlement not queued due to full queue");
+                    }
+
+                    let res = service_result?;
+                    let payment_response = make_payment_response_header(true, None);
+
+                    let (req, response) = res.into_parts();
+                    let mut response = response.map_into_left_body();
+                    if let Ok(hv) = HeaderValue::from_str(&payment_response) {
+                        response.headers_mut().insert(
+                            HeaderName::from_static("payment-response"),
+                            hv,
+                        );
+                    }
+                    Ok(ServiceResponse::new(req, response))
+                }
+                Ok(vr) => {
+                    let error_msg = vr
+                        .invalid_reason
+                        .unwrap_or_else(|| "Payment verification failed".to_string());
+                    warn!("Payment verification failed (parallel): {}", error_msg);
+                    if let Some(ref payer) = payer_address {
+                        verification_cache.record_failure(payer);
+                    }
+
+                    let payment_response =
+                        make_payment_response_header(false, Some(&error_msg));
+                    let response = HttpResponse::PaymentRequired()
+                        .insert_header((
+                            HeaderName::from_static("payment-response"),
+                            HeaderValue::from_str(&payment_response)
+                                .unwrap_or_else(|_| HeaderValue::from_static("")),
+                        ))
+                        .body(format!("Payment verification failed: {}", error_msg));
+
+                    match service_result {
+                        Ok(res) => {
+                            let (req, _) = res.into_parts();
+                            Ok(ServiceResponse::new(
+                                req,
+                                response.map_into_right_body(),
+                            ))
+                        }
+                        Err(_) => Err(actix_web::error::ErrorPaymentRequired(error_msg)),
+                    }
+                }
+                Err(e) => {
+                    error!("Facilitator error (parallel): {}", e);
+                    let response = HttpResponse::BadGateway()
+                        .body(format!("Facilitator error: {}", e));
+
+                    match service_result {
+                        Ok(res) => {
+                            let (req, _) = res.into_parts();
+                            Ok(ServiceResponse::new(
+                                req,
+                                response.map_into_right_body(),
+                            ))
+                        }
+                        Err(_) => Err(actix_web::error::ErrorBadGateway(format!(
+                            "Facilitator error: {}",
+                            e
+                        ))),
+                    }
+                }
+            }
+        }
     }
 }
 

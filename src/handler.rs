@@ -2,7 +2,7 @@ use crate::endpoints::ResolvedEndpoint;
 use crate::error::AppError;
 use crate::models::{ChatMessage, ChatRequest};
 use crate::services::InferenceClient;
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use tracing::{debug, info, warn};
 
 /// Estimate token count from text (chars / 4 heuristic)
@@ -21,20 +21,32 @@ fn estimate_request_tokens(request: &ChatRequest) -> u32 {
         .sum()
 }
 
-/// Generic chat handler parameterized by ResolvedEndpoint.
-/// Payment verification is handled by the x402 middleware.
-pub async fn chat_handler(
-    client: web::Data<InferenceClient>,
-    endpoint: web::Data<ResolvedEndpoint>,
+/// Unified chat handler — reads InferenceClient and ResolvedEndpoint from
+/// request extensions (injected by UnifiedDispatchMiddleware).
+pub async fn unified_chat_handler(
+    req: HttpRequest,
     request: web::Json<ChatRequest>,
 ) -> Result<HttpResponse, AppError> {
+    let (client, endpoint) = {
+        let ext = req.extensions();
+        let client = ext
+            .get::<InferenceClient>()
+            .cloned()
+            .ok_or_else(|| AppError::Internal("Missing InferenceClient in request extensions".into()))?;
+        let endpoint = ext
+            .get::<ResolvedEndpoint>()
+            .cloned()
+            .ok_or_else(|| AppError::Internal("Missing ResolvedEndpoint in request extensions".into()))?;
+        (client, endpoint)
+    };
+
     info!("Processing chat request for endpoint: {}", endpoint.def.name);
     debug!("Chat request: {:?}", request);
 
     let mut final_request = request.into_inner();
 
     // Prepend system prompt if configured and no system message exists
-    if let Some(ref system_prompt) = endpoint.system_prompt {
+    if let Some(system_prompt) = &endpoint.system_prompt {
         let has_system_message = final_request
             .messages
             .iter()

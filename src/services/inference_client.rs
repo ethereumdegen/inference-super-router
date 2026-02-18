@@ -29,20 +29,6 @@ impl InferenceClient {
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, AppError> {
         info!("Sending chat request to {} at: {}", self.archetype, self.endpoint);
 
-        // Enforce model: reject requests that specify a different model than configured
-        if let Some(ref requested_model) = request.model {
-            if !requested_model.is_empty() && requested_model != &self.default_model {
-                error!(
-                    "Rejected request with model '{}' — relay is configured for '{}'",
-                    requested_model, self.default_model
-                );
-                return Err(AppError::InferenceBackend(format!(
-                    "Model '{}' not available on this relay. Omit the model field to use the default.",
-                    requested_model
-                )));
-            }
-        }
-
         info!("Using model: {}, messages: {}", self.default_model, request.messages.len());
 
         // Always use the relay's configured model

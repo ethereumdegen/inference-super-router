@@ -33,6 +33,9 @@ pub struct EndpointDef {
     pub system_prompt_file: Option<String>,
     /// Human-readable description shown in 402 responses
     pub description: String,
+    /// Whether this endpoint supports ERC-8128 credits (default: false)
+    #[serde(default)]
+    pub credits_enabled: bool,
 }
 
 /// A resolved endpoint with API key and system prompt loaded at startup

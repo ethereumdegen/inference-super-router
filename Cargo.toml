@@ -22,3 +22,9 @@ backoff = { version = "0.4", features = ["tokio"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 ron = "0.8"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+sha3 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+actix-http = "3"
+futures-core = "0.3"

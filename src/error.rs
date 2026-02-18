@@ -14,6 +14,12 @@ pub enum AppError {
     #[error("Input too large: {0}")]
     InputTooLarge(String),
 
+    #[error("ERC-8128 auth error: {0}")]
+    Erc8128Auth(String),
+
+    #[error("Credits service error: {0}")]
+    CreditsService(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -29,6 +35,12 @@ impl ResponseError for AppError {
             }
             AppError::InferenceBackend(msg) => {
                 HttpResponse::BadGateway().body(format!("Inference backend error: {}", msg))
+            }
+            AppError::Erc8128Auth(msg) => {
+                HttpResponse::Unauthorized().body(format!("ERC-8128 auth error: {}", msg))
+            }
+            AppError::CreditsService(msg) => {
+                HttpResponse::BadGateway().body(format!("Credits service error: {}", msg))
             }
             AppError::InputTooLarge(msg) => {
                 HttpResponse::BadRequest().body(format!("Input too large: {}", msg))

@@ -1,5 +1,6 @@
 mod config;
 mod endpoints;
+mod erc8128;
 mod error;
 mod handler;
 mod middleware;
@@ -10,62 +11,74 @@ mod services;
 use actix_cors::Cors;
 use actix_files::Files;
 use actix_web::{http::header, web, App, HttpResponse, HttpServer};
-use config::GlobalConfig;
+use config::{CreditsConfig, GlobalConfig};
 use endpoints::{load_endpoints, resolve_endpoint, ResolvedEndpoint};
-use middleware::X402Middleware;
+use middleware::{EndpointRegistry, RegisteredEndpoint, UnifiedDispatchMiddleware};
 use payment::EndpointPaymentConfig;
 use services::{
-    FacilitatorClient, InferenceClient, NonceTracker, RateLimiter, SettlementQueue,
+    CreditsClient, FacilitatorClient, InferenceClient, NonceTracker, RateLimiter, SettlementQueue,
     SettlementWorker, VerificationCache,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-/// Root endpoint — returns JSON with all available endpoints and usage info
+/// Root endpoint — returns human-readable plain text with all available models and usage info
 async fn root_handler(
-    endpoints_info: web::Data<Vec<EndpointInfo>>,
+    registry: web::Data<EndpointRegistry>,
+    global_config: web::Data<GlobalConfig>,
 ) -> HttpResponse {
-    let endpoints_json: Vec<serde_json::Value> = endpoints_info
-        .iter()
-        .map(|ep| {
-            serde_json::json!({
-                "name": ep.name,
-                "model": ep.model,
-                "description": ep.description,
-                "routes": {
-                    "chat": format!("{}/chat", ep.route_prefix),
-                    "openai_compatible": format!("{}/api/v1/chat/completions", ep.route_prefix),
-                },
-                "payment": {
-                    "currency": ep.payment_currency,
-                    "cost": ep.cost,
-                },
-                "limits": {
-                    "max_input_tokens": ep.max_input_tokens,
-                    "max_output_tokens": ep.max_output_tokens,
-                },
-            })
-        })
-        .collect();
+    let mut out = String::new();
+    out.push_str("inference-super-router\n");
+    out.push_str(&format!("version: {}\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!("wallet: {}\n", global_config.bot_wallet_address));
+    out.push_str(&format!("test_mode: {}\n", global_config.test_mode));
 
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "inference-super-router",
-        "description": "Multiplexed AI inference via x402 payment protocol",
-        "endpoints": endpoints_json,
-        "usage": {
-            "step_1": "POST to any endpoint route with an OpenAI-compatible chat payload",
-            "step_2": "If no payment header is present, you receive a 402 with payment requirements",
-            "step_3": "Create a payment using the x402 protocol and include it in the X-PAYMENT header (base64)",
-            "step_4": "The router verifies payment and proxies your request to the AI backend",
-        },
-        "system_routes": {
-            "info": "/",
-            "health": "/health",
-            "metrics": "/metrics",
-        },
-        "x402": "https://www.x402.org",
-    }))
+    out.push_str("\n--- models ---\n\n");
+
+    // Collect and sort models alphabetically
+    let mut models: Vec<(&String, &RegisteredEndpoint)> = registry.models.iter().collect();
+    models.sort_by_key(|(name, _)| name.to_lowercase());
+
+    for (name, reg) in &models {
+        out.push_str(&format!(
+            "  {:<16} {:>5} {:<10} {}\n",
+            name,
+            reg.endpoint.def.cost,
+            reg.endpoint.def.payment_currency,
+            reg.endpoint.def.description,
+        ));
+    }
+
+    // Show "auto" entry pointing to the default model
+    if let Some(default_reg) = registry.models.get(&registry.default_model) {
+        out.push_str(&format!(
+            "  {:<16} {:>5} {:<10} {} (default)\n",
+            "auto",
+            default_reg.endpoint.def.cost,
+            default_reg.endpoint.def.payment_currency,
+            default_reg.endpoint.def.description,
+        ));
+    }
+
+    out.push_str("\n--- usage ---\n\n");
+    out.push_str("  POST /chat  {\"model\": \"auto\", \"messages\": [...]}\n");
+    out.push_str("  POST /api/v1/chat/completions  (OpenAI-compatible)\n");
+    out.push_str("\n  \"model\" is required. Use \"auto\" for the default (credits-enabled) model.\n");
+    out.push_str("  Without an X-PAYMENT header, you'll receive a 402 with payment requirements.\n");
+    out.push_str("  Include a valid X-PAYMENT header (base64-encoded permit) to pay with x402.\n");
+    out.push_str("  For credits-enabled models, use ERC-8128 signed requests instead.\n");
+    out.push_str("\n  https://www.x402.org\n");
+
+    out.push_str("\n--- system routes ---\n\n");
+    out.push_str("  GET /         this page\n");
+    out.push_str("  GET /health   health check\n");
+    out.push_str("  GET /metrics  settlement & cache metrics\n");
+
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(out)
 }
 
 /// Health check
@@ -127,19 +140,6 @@ async fn metrics_handler(
     }))
 }
 
-/// Info stored about each endpoint for the root handler
-#[derive(Clone)]
-struct EndpointInfo {
-    name: String,
-    route_prefix: String,
-    model: String,
-    description: String,
-    cost: String,
-    payment_currency: String,
-    max_input_tokens: u32,
-    max_output_tokens: u32,
-}
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -163,6 +163,22 @@ async fn main() -> std::io::Result<()> {
     info!("Facilitator URL: {}", global_config.facilitator_url);
     info!("Test mode: {}", global_config.test_mode);
 
+    // Initialize credits system (optional)
+    let credits_client: Option<Arc<CreditsClient>> = match CreditsConfig::from_env() {
+        Some(cfg) => {
+            info!(
+                "Credits system enabled (admin address: {})",
+                cfg.signer.address()
+            );
+            let client = CreditsClient::new(&cfg.api_url, cfg.signer);
+            Some(Arc::new(client))
+        }
+        None => {
+            info!("Credits system disabled (CREDITS_ADMIN_PRIVATE_KEY not set)");
+            None
+        }
+    };
+
     // Load and resolve endpoints from RON config
     let endpoints_config = load_endpoints(&global_config.endpoints_config_path);
     info!("Loaded {} endpoint definitions from {}", endpoints_config.endpoints.len(), global_config.endpoints_config_path);
@@ -172,9 +188,10 @@ async fn main() -> std::io::Result<()> {
         match resolve_endpoint(def) {
             Ok(ep) => {
                 info!(
-                    "  {} -> {} [{}] cost={} ({})",
-                    ep.def.route_prefix, ep.def.api_endpoint, ep.def.archetype,
-                    ep.def.cost, ep.def.payment_currency
+                    "  {} -> {} [{}] cost={} ({}){}",
+                    ep.def.name, ep.def.api_endpoint, ep.def.archetype,
+                    ep.def.cost, ep.def.payment_currency,
+                    if ep.def.credits_enabled { " [credits]" } else { "" }
                 );
                 resolved_endpoints.push(ep);
             }
@@ -185,20 +202,48 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    // Build endpoint info for root handler
-    let endpoints_info: Vec<EndpointInfo> = resolved_endpoints
-        .iter()
-        .map(|ep| EndpointInfo {
-            name: ep.def.name.clone(),
-            route_prefix: ep.def.route_prefix.clone(),
-            model: ep.def.model.clone(),
-            description: ep.def.description.clone(),
-            cost: ep.def.cost.clone(),
-            payment_currency: ep.def.payment_currency.clone(),
-            max_input_tokens: ep.def.max_input_tokens,
-            max_output_tokens: ep.def.max_output_tokens,
-        })
-        .collect();
+    // Build EndpointRegistry from resolved endpoints
+    let mut registry_models: HashMap<String, RegisteredEndpoint> = HashMap::new();
+    let mut default_model_name = String::new();
+
+    for ep in &resolved_endpoints {
+        let client = InferenceClient::new(
+            &ep.def.api_endpoint,
+            &ep.api_key,
+            &ep.def.model,
+            &ep.def.archetype,
+        );
+
+        let payment_config = EndpointPaymentConfig::from_config_and_endpoint(
+            &global_config,
+            &ep.def,
+        );
+
+        let use_credits = ep.def.credits_enabled && credits_client.is_some();
+
+        registry_models.insert(ep.def.name.clone(), RegisteredEndpoint {
+            endpoint: ep.clone(),
+            client,
+            payment_config,
+            credits_enabled: use_credits,
+        });
+
+        if ep.def.credits_enabled && default_model_name.is_empty() {
+            default_model_name = ep.def.name.clone();
+        }
+    }
+
+    // Fallback: if no credits-enabled endpoint, use the first one as default
+    if default_model_name.is_empty() && !registry_models.is_empty() {
+        default_model_name = resolved_endpoints[0].def.name.clone();
+    }
+
+    let registry = Arc::new(EndpointRegistry {
+        models: registry_models,
+        default_model: default_model_name.clone(),
+    });
+
+    info!("EndpointRegistry built with {} models, default: '{}'", registry.models.len(), default_model_name);
 
     // Create shared services
     let facilitator_client = FacilitatorClient::new(&global_config.facilitator_url);
@@ -240,7 +285,9 @@ async fn main() -> std::io::Result<()> {
     let settlement_queue_for_app = settlement_queue.clone();
     let worker_metrics_for_app = worker_metrics.clone();
     let verification_cache_for_app = verification_cache.clone();
+    let credits_client_for_app = credits_client.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
+    let registry_for_app = registry.clone();
 
     let server = HttpServer::new(move || {
         let cors = Cors::default()
@@ -250,16 +297,47 @@ async fn main() -> std::io::Result<()> {
                 header::CONTENT_TYPE,
                 header::AUTHORIZATION,
                 header::HeaderName::from_static("x-payment"),
+                header::HeaderName::from_static("signature-input"),
+                header::HeaderName::from_static("signature"),
+                header::HeaderName::from_static("content-digest"),
             ])
             .expose_headers(vec![
                 header::HeaderName::from_static("payment-required"),
                 header::HeaderName::from_static("payment-response"),
+                header::HeaderName::from_static("x-erc8128-credits"),
             ])
             .max_age(3600);
 
-        let mut app = App::new()
+        let chat_scope = web::scope("/chat")
+            .wrap(UnifiedDispatchMiddleware::new(
+                global_config.clone(),
+                registry_for_app.clone(),
+                facilitator_client.clone(),
+                nonce_tracker.clone(),
+                settlement_queue.clone(),
+                rate_limiter.clone(),
+                verification_cache.clone(),
+                credits_client_for_app.clone(),
+            ))
+            .route("", web::post().to(handler::unified_chat_handler));
+
+        let api_scope = web::scope("/api/v1/chat")
+            .wrap(UnifiedDispatchMiddleware::new(
+                global_config.clone(),
+                registry_for_app.clone(),
+                facilitator_client.clone(),
+                nonce_tracker.clone(),
+                settlement_queue.clone(),
+                rate_limiter.clone(),
+                verification_cache.clone(),
+                credits_client_for_app.clone(),
+            ))
+            .route("/completions", web::post().to(handler::unified_chat_handler));
+
+        App::new()
             .wrap(cors)
-            .app_data(web::Data::new(endpoints_info.clone()))
+            .app_data(web::Data::new(global_config.clone()))
+            .app_data(web::Data::from(registry_for_app.clone()))
             .app_data(web::Data::new(settlement_queue_for_app.clone()))
             .app_data(web::Data::new(worker_metrics_for_app.clone()))
             .app_data(web::Data::new(verification_cache_for_app.clone()))
@@ -267,59 +345,9 @@ async fn main() -> std::io::Result<()> {
             .route("/", web::get().to(root_handler))
             .route("/health", web::get().to(health_handler))
             .route("/metrics", web::get().to(metrics_handler))
-            .service(Files::new("/.well-known", "public/.well-known"));
-
-        // Dynamic route registration from resolved endpoints
-        for ep in &resolved_endpoints {
-            let client = InferenceClient::new(
-                &ep.def.api_endpoint,
-                &ep.api_key,
-                &ep.def.model,
-                &ep.def.archetype,
-            );
-
-            let payment_config = EndpointPaymentConfig::from_config_and_endpoint(
-                &global_config,
-                &ep.def,
-            );
-
-            let ep_clone = ep.clone();
-            let prefix = ep.def.route_prefix.clone();
-
-            // Register {prefix}/chat
-            let chat_scope = web::scope(&format!("{}/chat", prefix))
-                .wrap(X402Middleware::new(
-                    global_config.clone(),
-                    payment_config.clone(),
-                    facilitator_client.clone(),
-                    nonce_tracker.clone(),
-                    settlement_queue.clone(),
-                    rate_limiter.clone(),
-                    verification_cache.clone(),
-                ))
-                .app_data(web::Data::new(client.clone()))
-                .app_data(web::Data::new(ep_clone.clone()))
-                .route("", web::post().to(handler::chat_handler));
-
-            // Register {prefix}/api/v1/chat/completions
-            let api_scope = web::scope(&format!("{}/api/v1/chat", prefix))
-                .wrap(X402Middleware::new(
-                    global_config.clone(),
-                    payment_config,
-                    facilitator_client.clone(),
-                    nonce_tracker.clone(),
-                    settlement_queue.clone(),
-                    rate_limiter.clone(),
-                    verification_cache.clone(),
-                ))
-                .app_data(web::Data::new(client))
-                .app_data(web::Data::new(ep_clone))
-                .route("/completions", web::post().to(handler::chat_handler));
-
-            app = app.service(chat_scope).service(api_scope);
-        }
-
-        app
+            .service(Files::new("/.well-known", "public/.well-known"))
+            .service(chat_scope)
+            .service(api_scope)
     })
     .bind(("0.0.0.0", port))?
     .run();
