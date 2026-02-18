@@ -197,22 +197,32 @@ where
 
             // Try credits path if applicable
             let use_credits = registered.credits_enabled && credits_client.is_some();
+            let has_erc8128 = erc8128::has_erc8128_headers(req.headers());
 
-            if use_credits && erc8128::has_erc8128_headers(req.headers()) {
-                debug!("ERC-8128 headers detected, attempting credits path");
+            info!(
+                "[CREDITS] credits_enabled={}, credits_client={}, has_erc8128_headers={}, model={}",
+                registered.credits_enabled,
+                credits_client.is_some(),
+                has_erc8128,
+                model_key
+            );
+
+            if use_credits && has_erc8128 {
+                info!("[CREDITS] Attempting ERC-8128 credits path");
                 let cc = credits_client.as_ref().unwrap();
 
                 match erc8128::verify_from_request(req.request(), &body_bytes) {
                     Ok(identity) => {
                         let wallet = identity.wallet_address.to_lowercase();
-                        info!("ERC-8128 verified for wallet: {}", wallet);
+                        info!("[CREDITS] ERC-8128 verified for wallet: {} (chain: {})", wallet, identity.chain_id);
 
                         match cc.get_credits(&wallet).await {
                             Ok(credits) if credits > 0 => {
+                                info!("[CREDITS] Wallet {} has {} credits, deducting 1", wallet, credits);
                                 match cc.adjust_credits(&wallet, -1).await {
                                     Ok(new_balance) => {
                                         info!(
-                                            "Deducted 1 credit from {}: {} remaining",
+                                            "[CREDITS] SUCCESS: deducted 1 credit from {}: {} remaining",
                                             wallet, new_balance
                                         );
                                         set_payload_from_bytes(&mut req, body_bytes);
@@ -221,7 +231,7 @@ where
                                     }
                                     Err(e) => {
                                         warn!(
-                                            "Failed to deduct credits for {}: {}",
+                                            "[CREDITS] Failed to deduct credits for {}: {}",
                                             wallet, e
                                         );
                                         // Fall through to x402
@@ -230,19 +240,21 @@ where
                             }
                             Ok(credits) => {
                                 info!(
-                                    "Wallet {} has {} credits, falling through to x402",
+                                    "[CREDITS] Wallet {} has {} credits (insufficient), falling through to x402",
                                     wallet, credits
                                 );
                             }
                             Err(e) => {
-                                warn!("Credits check failed for {}: {}", wallet, e);
+                                warn!("[CREDITS] Credits check failed for {}: {}", wallet, e);
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("ERC-8128 verification failed: {}", e);
+                        warn!("[CREDITS] ERC-8128 verification failed: {}", e);
                     }
                 }
+            } else if use_credits {
+                info!("[CREDITS] No ERC-8128 headers in request, skipping credits path");
             }
 
             // Re-attach body and fall through to x402 payment flow

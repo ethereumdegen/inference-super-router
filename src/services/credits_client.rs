@@ -34,6 +34,11 @@ impl CreditsClient {
         let authority = extract_authority(&self.base_url);
         let signing_path = format!("{}{}", extract_path_prefix(&self.base_url), route);
 
+        debug!(
+            "[CREDITS_CLIENT] get_credits: url={}, authority={}, signing_path={}, signer_addr={}",
+            url, authority, signing_path, self.signer.address()
+        );
+
         let signed = self
             .signer
             .sign_request("GET", &authority, &signing_path, Some(&query), None)
@@ -58,9 +63,11 @@ impl CreditsClient {
             .map_err(|e| format!("Failed to read credits response: {}", e))?;
 
         if !status.is_success() {
-            error!("Credits API returned {}: {}", status, body);
+            error!("[CREDITS_CLIENT] get_credits failed: status={}, body={}, url={}", status, body, url);
             return Err(format!("Credits API error {}: {}", status, body));
         }
+
+        debug!("[CREDITS_CLIENT] get_credits response: {}", body);
 
         // Parse response: expect {"credits": N} or just a number
         let json: serde_json::Value = serde_json::from_str(&body)
@@ -96,6 +103,11 @@ impl CreditsClient {
         let authority = extract_authority(&self.base_url);
         let signing_path = format!("{}{}", extract_path_prefix(&self.base_url), route);
 
+        debug!(
+            "[CREDITS_CLIENT] adjust_credits: url={}, authority={}, signing_path={}, wallet={}, delta={}",
+            url, authority, signing_path, wallet_address, delta
+        );
+
         let signed = self
             .signer
             .sign_request("POST", &authority, &signing_path, None, Some(&body_bytes))
@@ -125,7 +137,7 @@ impl CreditsClient {
             .map_err(|e| format!("Failed to read credits response: {}", e))?;
 
         if !status.is_success() {
-            error!("Credits API returned {}: {}", status, resp_body);
+            error!("[CREDITS_CLIENT] adjust_credits failed: status={}, body={}, url={}", status, resp_body, url);
             return Err(format!("Credits API error {}: {}", status, resp_body));
         }
 
