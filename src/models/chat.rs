@@ -97,6 +97,9 @@ pub struct ChatRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    /// Payment method preference: "auto" (default), "credits", or "x402"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_type: Option<String>,
 }
 
 /// OpenAI-compatible chat response (lenient deserialization for provider compatibility)
@@ -180,6 +183,7 @@ mod tests {
                 },
             }]),
             tool_choice: Some(json!("auto")),
+            payment_type: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -239,6 +243,7 @@ mod tests {
             stream: None,
             tools: None,
             tool_choice: None,
+            payment_type: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -247,5 +252,6 @@ mod tests {
         assert!(!parsed.as_object().unwrap().contains_key("tools"));
         assert!(!parsed.as_object().unwrap().contains_key("tool_choice"));
         assert!(!parsed.as_object().unwrap().contains_key("model"));
+        assert!(!parsed.as_object().unwrap().contains_key("payment_type"));
     }
 }

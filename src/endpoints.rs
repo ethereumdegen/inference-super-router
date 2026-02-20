@@ -33,9 +33,9 @@ pub struct EndpointDef {
     pub system_prompt_file: Option<String>,
     /// Human-readable description shown in 402 responses
     pub description: String,
-    /// Whether this endpoint supports ERC-8128 credits (default: false)
+    /// Credit cost per request in raw USDC units (1,000,000 = $1). 0 = credits not accepted.
     #[serde(default)]
-    pub credits_enabled: bool,
+    pub credit_cost: i64,
 }
 
 /// A resolved endpoint with API key and system prompt loaded at startup

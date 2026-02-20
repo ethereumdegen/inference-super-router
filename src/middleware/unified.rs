@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::future::{poll_fn, ready, Future, Ready};
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// A registered endpoint with all configuration needed for dispatch.
 #[derive(Clone)]
@@ -32,7 +32,7 @@ pub struct RegisteredEndpoint {
     pub endpoint: ResolvedEndpoint,
     pub client: InferenceClient,
     pub payment_config: EndpointPaymentConfig,
-    pub credits_enabled: bool,
+    pub credit_cost: i64,
 }
 
 /// Registry of all available endpoints, keyed by model name.
@@ -159,10 +159,14 @@ where
             // Buffer the request body to peek at the model field
             let body_bytes = drain_payload(&mut req).await;
 
-            // Parse body as JSON and extract model
-            let model_name = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                .ok()
+            // Parse body as JSON and extract model + payment_type
+            let parsed_body = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+            let model_name = parsed_body
+                .as_ref()
                 .and_then(|json| json.get("model").and_then(|v| v.as_str()).map(String::from));
+            let payment_type = parsed_body
+                .as_ref()
+                .and_then(|json| json.get("payment_type").and_then(|v| v.as_str()).map(String::from));
 
             // Resolve model name: None, empty, or "auto" → default_model
             let model_key = match model_name.as_deref() {
@@ -195,20 +199,66 @@ where
             req.extensions_mut().insert(registered.client.clone());
             req.extensions_mut().insert(registered.endpoint.clone());
 
-            // Try credits path if applicable
-            let use_credits = registered.credits_enabled && credits_client.is_some();
-            let has_erc8128 = erc8128::has_erc8128_headers(req.headers());
+            // Resolve payment_type: None, empty, or "auto" → auto
+            let pay_mode = match payment_type.as_deref() {
+                None | Some("") | Some("auto") => "auto",
+                Some("credits") => "credits",
+                Some("x402") => "x402",
+                Some(other) => {
+                    let response = HttpResponse::BadRequest().json(serde_json::json!({
+                        "error": format!(
+                            "Unknown payment_type: '{}'. Valid values: \"auto\", \"credits\", \"x402\"",
+                            other
+                        ),
+                    }));
+                    return Ok(req.into_response(response).map_into_right_body());
+                }
+            };
 
             info!(
-                "[CREDITS] credits_enabled={}, credits_client={}, has_erc8128_headers={}, model={}",
-                registered.credits_enabled,
-                credits_client.is_some(),
-                has_erc8128,
-                model_key
+                "Unified dispatch: payment_type='{}', model='{}'",
+                pay_mode, model_key
             );
 
-            if use_credits && has_erc8128 {
-                info!("[CREDITS] Attempting ERC-8128 credits path");
+            // Check if credits path is viable for this endpoint
+            let credit_cost = registered.credit_cost;
+            let credits_available = credit_cost > 0 && credits_client.is_some();
+            let has_erc8128 = erc8128::has_erc8128_headers(req.headers());
+
+            // If client explicitly requested credits but this endpoint doesn't support them
+            if pay_mode == "credits" && !credits_available {
+                let response = HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": format!(
+                        "Model '{}' does not support credits payment. Use payment_type \"x402\" or \"auto\".",
+                        model_key
+                    ),
+                }));
+                return Ok(req.into_response(response).map_into_right_body());
+            }
+
+            info!(
+                "[CREDITS] credit_cost={}, credits_client={}, has_erc8128_headers={}, model={}, pay_mode={}",
+                credit_cost,
+                credits_client.is_some(),
+                has_erc8128,
+                model_key,
+                pay_mode
+            );
+
+            // Try credits path if applicable (auto+headers or explicit credits)
+            let try_credits = credits_available
+                && (pay_mode == "credits" || (pay_mode == "auto" && has_erc8128));
+
+            if try_credits {
+                if pay_mode == "credits" && !has_erc8128 {
+                    // Client asked for credits but didn't send ERC-8128 headers
+                    let response = HttpResponse::BadRequest().json(serde_json::json!({
+                        "error": "payment_type \"credits\" requires ERC-8128 signed request headers (Signature-Input, Signature, Content-Digest).",
+                    }));
+                    return Ok(req.into_response(response).map_into_right_body());
+                }
+
+                info!("[CREDITS] Attempting ERC-8128 credits path (cost={})", credit_cost);
                 let cc = credits_client.as_ref().unwrap();
 
                 match erc8128::verify_from_request(req.request(), &body_bytes) {
@@ -217,51 +267,84 @@ where
                         info!("[CREDITS] ERC-8128 verified for wallet: {} (chain: {})", wallet, identity.chain_id);
 
                         match cc.get_credits(&wallet).await {
-                            Ok(credits) if credits > 0 => {
-                                info!("[CREDITS] Wallet {} has {} credits, deducting 1", wallet, credits);
-                                match cc.adjust_credits(&wallet, -1).await {
+                            Ok(credits) if credits >= credit_cost => {
+                                info!("[CREDITS] Wallet {} has {} credits, deducting {}", wallet, credits, credit_cost);
+                                match cc.adjust_credits(&wallet, -credit_cost).await {
                                     Ok(new_balance) => {
                                         info!(
-                                            "[CREDITS] SUCCESS: deducted 1 credit from {}: {} remaining",
-                                            wallet, new_balance
+                                            "[CREDITS] SUCCESS: deducted {} credits from {}: {} remaining",
+                                            credit_cost, wallet, new_balance
                                         );
                                         set_payload_from_bytes(&mut req, body_bytes);
                                         let res = service.call(req).await?;
                                         return Ok(res.map_into_left_body());
                                     }
                                     Err(e) => {
-                                        warn!(
-                                            "[CREDITS] Failed to deduct credits for {}: {}",
-                                            wallet, e
-                                        );
-                                        // Fall through to x402
+                                        warn!("[CREDITS] Failed to deduct credits for {}: {}", wallet, e);
+                                        if pay_mode == "credits" {
+                                            let response = HttpResponse::InternalServerError().json(serde_json::json!({
+                                                "error": format!("Credits deduction failed: {}", e),
+                                            }));
+                                            return Ok(req.into_response(response).map_into_right_body());
+                                        }
+                                        // auto: fall through to x402
                                     }
                                 }
                             }
                             Ok(credits) => {
+                                if pay_mode == "credits" {
+                                    let response = HttpResponse::PaymentRequired().json(serde_json::json!({
+                                        "error": format!(
+                                            "Insufficient credits: have {}, need {} for model '{}'",
+                                            credits, credit_cost, model_key
+                                        ),
+                                    }));
+                                    return Ok(req.into_response(response).map_into_right_body());
+                                }
                                 info!(
-                                    "[CREDITS] Wallet {} has {} credits (insufficient), falling through to x402",
-                                    wallet, credits
+                                    "[CREDITS] Wallet {} has {} credits (need {}, insufficient), falling through to x402",
+                                    wallet, credits, credit_cost
                                 );
                             }
                             Err(e) => {
                                 warn!("[CREDITS] Credits check failed for {}: {}", wallet, e);
+                                if pay_mode == "credits" {
+                                    let response = HttpResponse::InternalServerError().json(serde_json::json!({
+                                        "error": format!("Credits check failed: {}", e),
+                                    }));
+                                    return Ok(req.into_response(response).map_into_right_body());
+                                }
                             }
                         }
                     }
                     Err(e) => {
                         warn!("[CREDITS] ERC-8128 verification failed: {}", e);
+                        if pay_mode == "credits" {
+                            let response = HttpResponse::Unauthorized().json(serde_json::json!({
+                                "error": format!("ERC-8128 signature verification failed: {}", e),
+                            }));
+                            return Ok(req.into_response(response).map_into_right_body());
+                        }
                     }
                 }
-            } else if use_credits {
+            } else if pay_mode == "auto" && credits_available {
                 info!("[CREDITS] No ERC-8128 headers in request, skipping credits path");
             }
 
-            // Re-attach body and fall through to x402 payment flow
+            // If client explicitly requested credits, we would have returned above.
+            // If we're here with pay_mode == "credits", something unexpected happened.
+            if pay_mode == "credits" {
+                let response = HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": "Credits payment failed unexpectedly.",
+                }));
+                return Ok(req.into_response(response).map_into_right_body());
+            }
+
+            // Re-attach body and proceed to x402 payment flow
             set_payload_from_bytes(&mut req, body_bytes);
 
             let credits_headers: [(&str, &str); 1] = [("x-erc8128-credits", "true")];
-            let extra_headers: Option<&[(&str, &str)]> = if use_credits {
+            let extra_headers: Option<&[(&str, &str)]> = if credits_available {
                 Some(&credits_headers)
             } else {
                 None

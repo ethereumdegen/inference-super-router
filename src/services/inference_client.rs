@@ -58,6 +58,11 @@ impl InferenceClient {
             }
         }
 
+        // Strip internal fields that upstream APIs don't understand
+        if let Some(obj) = request_body.as_object_mut() {
+            obj.remove("payment_type");
+        }
+
         info!(
             ">>> API REQUEST [{}]:\n{}",
             self.archetype,

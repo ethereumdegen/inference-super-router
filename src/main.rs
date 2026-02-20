@@ -66,9 +66,10 @@ async fn root_handler(
     out.push_str("  POST /chat  {\"model\": \"auto\", \"messages\": [...]}\n");
     out.push_str("  POST /api/v1/chat/completions  (OpenAI-compatible)\n");
     out.push_str("\n  \"model\" is required. Use \"auto\" for the default (credits-enabled) model.\n");
-    out.push_str("  Without an X-PAYMENT header, you'll receive a 402 with payment requirements.\n");
-    out.push_str("  Include a valid X-PAYMENT header (base64-encoded permit) to pay with x402.\n");
-    out.push_str("  For credits-enabled models, use ERC-8128 signed requests instead.\n");
+    out.push_str("\n  \"payment_type\" is optional: \"auto\" (default), \"credits\", or \"x402\".\n");
+    out.push_str("    auto    — try credits first (if ERC-8128 headers present), fall back to x402\n");
+    out.push_str("    credits — only accept credits (requires ERC-8128 signed request)\n");
+    out.push_str("    x402    — only accept x402 payment (requires X-PAYMENT header)\n");
     out.push_str("\n  https://www.x402.org\n");
 
     out.push_str("\n--- system routes ---\n\n");
@@ -191,7 +192,7 @@ async fn main() -> std::io::Result<()> {
                     "  {} -> {} [{}] cost={} ({}){}",
                     ep.def.name, ep.def.api_endpoint, ep.def.archetype,
                     ep.def.cost, ep.def.payment_currency,
-                    if ep.def.credits_enabled { " [credits]" } else { "" }
+                    if ep.def.credit_cost > 0 { format!(" [credits: {}]", ep.def.credit_cost) } else { String::new() }
                 );
                 resolved_endpoints.push(ep);
             }
@@ -219,16 +220,16 @@ async fn main() -> std::io::Result<()> {
             &ep.def,
         );
 
-        let use_credits = ep.def.credits_enabled && credits_client.is_some();
+        let credit_cost = if credits_client.is_some() { ep.def.credit_cost } else { 0 };
 
         registry_models.insert(ep.def.name.clone(), RegisteredEndpoint {
             endpoint: ep.clone(),
             client,
             payment_config,
-            credits_enabled: use_credits,
+            credit_cost,
         });
 
-        if ep.def.credits_enabled && default_model_name.is_empty() {
+        if credit_cost > 0 && default_model_name.is_empty() {
             default_model_name = ep.def.name.clone();
         }
     }

@@ -13,6 +13,7 @@
       max_output_tokens: 50000,
       system_prompt_file: Some("prompts/kimi.md"),
       description: "Kimi K2.5 via x402",
+      credit_cost: 10000,
     ),
     (
       name: "gpt-5-mini",
@@ -27,6 +28,7 @@
       max_output_tokens: 50000,
       system_prompt_file: None,
       description: "GPT-5 Mini via x402",
+      credit_cost: 7500,
     ),
     (
       name: "MiniMax-M2.5",
@@ -41,6 +43,7 @@
       max_output_tokens: 50000,
       system_prompt_file: None,
       description: "MiniMax M2.5 via x402",
+      credit_cost: 5000,
     ),
     (
       name: "kimi-turbo",
@@ -55,7 +58,7 @@
       max_output_tokens: 50000,
       system_prompt_file: None,
       description: "Kimi K2 Turbo via credits or x402",
-      credits_enabled: true,
+      credit_cost: 5000,
     ),
     (
       name: "morpheus-glm5",
@@ -70,6 +73,7 @@
       max_output_tokens: 50000,
       system_prompt_file: None,
       description: "GLM-5 via Morpheus (free)",
+      credit_cost: 0,
     ),
   ],
 )

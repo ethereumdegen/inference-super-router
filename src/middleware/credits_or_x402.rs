@@ -36,6 +36,7 @@ pub struct CreditsOrX402Middleware {
     rate_limiter: Arc<RateLimiter>,
     verification_cache: Arc<VerificationCache>,
     credits_client: Arc<CreditsClient>,
+    credit_cost: i64,
 }
 
 impl CreditsOrX402Middleware {
@@ -49,6 +50,7 @@ impl CreditsOrX402Middleware {
         rate_limiter: Arc<RateLimiter>,
         verification_cache: Arc<VerificationCache>,
         credits_client: Arc<CreditsClient>,
+        credit_cost: i64,
     ) -> Self {
         Self {
             global_config,
@@ -59,6 +61,7 @@ impl CreditsOrX402Middleware {
             rate_limiter,
             verification_cache,
             credits_client,
+            credit_cost,
         }
     }
 }
@@ -86,6 +89,7 @@ where
             rate_limiter: self.rate_limiter.clone(),
             verification_cache: self.verification_cache.clone(),
             credits_client: self.credits_client.clone(),
+            credit_cost: self.credit_cost,
         }))
     }
 }
@@ -100,6 +104,7 @@ pub struct CreditsOrX402MiddlewareService<S> {
     rate_limiter: Arc<RateLimiter>,
     verification_cache: Arc<VerificationCache>,
     credits_client: Arc<CreditsClient>,
+    credit_cost: i64,
 }
 
 impl<S, B> Service<ServiceRequest> for CreditsOrX402MiddlewareService<S>
@@ -124,6 +129,7 @@ where
         let rate_limiter = self.rate_limiter.clone();
         let verification_cache = self.verification_cache.clone();
         let credits_client = self.credits_client.clone();
+        let credit_cost = self.credit_cost;
 
         Box::pin(async move {
             // TEST_MODE: skip all payment/credits
@@ -150,13 +156,13 @@ where
 
                         // Check credit balance
                         match credits_client.get_credits(&wallet).await {
-                            Ok(credits) if credits > 0 => {
-                                // Deduct 1 credit
-                                match credits_client.adjust_credits(&wallet, -1).await {
+                            Ok(credits) if credits >= credit_cost => {
+                                // Deduct credits
+                                match credits_client.adjust_credits(&wallet, -credit_cost).await {
                                     Ok(new_balance) => {
                                         info!(
-                                            "Deducted 1 credit from {}: {} remaining",
-                                            wallet, new_balance
+                                            "Deducted {} credits from {}: {} remaining",
+                                            credit_cost, wallet, new_balance
                                         );
 
                                         // Re-attach body and call service
