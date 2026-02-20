@@ -21,7 +21,7 @@ use services::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Root endpoint — returns human-readable plain text with all available models and usage info
@@ -80,6 +80,50 @@ async fn root_handler(
     HttpResponse::Ok()
         .content_type("text/plain")
         .body(out)
+}
+
+/// Credits balance endpoint — returns the caller's credit balance.
+///
+/// Requires ERC-8128 signed request headers. The wallet address is recovered
+/// from the signature (no query param needed).
+async fn credits_balance_handler(
+    req: actix_web::HttpRequest,
+    credits_client: Option<web::Data<Arc<CreditsClient>>>,
+) -> HttpResponse {
+    let credits_client = match credits_client {
+        Some(c) => c,
+        None => {
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "Credits system not enabled"
+            }));
+        }
+    };
+
+    // Verify ERC-8128 signature to recover wallet address
+    let identity = match erc8128::verify_from_request(&req, &[]) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("Credits balance: ERC-8128 verification failed: {}", e);
+            return HttpResponse::Unauthorized().json(serde_json::json!({
+                "error": format!("ERC-8128 signature required: {}", e)
+            }));
+        }
+    };
+
+    match credits_client.get_credits(&identity.wallet_address).await {
+        Ok(balance) => {
+            HttpResponse::Ok().json(serde_json::json!({
+                "credits": balance,
+                "address": identity.wallet_address
+            }))
+        }
+        Err(e) => {
+            error!("Credits balance lookup failed for {}: {}", identity.wallet_address, e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to fetch credit balance"
+            }))
+        }
+    }
 }
 
 /// Health check
@@ -335,17 +379,25 @@ async fn main() -> std::io::Result<()> {
             ))
             .route("/completions", web::post().to(handler::unified_chat_handler));
 
-        App::new()
+        let mut app = App::new()
             .wrap(cors)
             .app_data(web::Data::new(global_config.clone()))
             .app_data(web::Data::from(registry_for_app.clone()))
             .app_data(web::Data::new(settlement_queue_for_app.clone()))
             .app_data(web::Data::new(worker_metrics_for_app.clone()))
-            .app_data(web::Data::new(verification_cache_for_app.clone()))
+            .app_data(web::Data::new(verification_cache_for_app.clone()));
+
+        // Conditionally register credits_client as app_data (for balance endpoint)
+        if let Some(ref cc) = credits_client_for_app {
+            app = app.app_data(web::Data::new(cc.clone()));
+        }
+
+        app
             // Public endpoints
             .route("/", web::get().to(root_handler))
             .route("/health", web::get().to(health_handler))
             .route("/metrics", web::get().to(metrics_handler))
+            .route("/credits/balance", web::get().to(credits_balance_handler))
             .service(Files::new("/.well-known", "public/.well-known"))
             .service(chat_scope)
             .service(api_scope)
