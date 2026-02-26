@@ -126,6 +126,44 @@ async fn credits_balance_handler(
     }
 }
 
+/// Public endpoint catalog — returns JSON array of all available models with pricing.
+/// Consumed by stark-bot (and any other client) to build UI dropdowns dynamically.
+async fn endpoints_handler(
+    registry: web::Data<EndpointRegistry>,
+    global_config: web::Data<GlobalConfig>,
+) -> HttpResponse {
+    let base_url = global_config.base_url.as_deref().unwrap_or("https://inference.defirelay.com");
+    let base_url = base_url.trim_end_matches('/');
+
+    let mut entries: Vec<serde_json::Value> = registry
+        .models
+        .iter()
+        .map(|(name, reg)| {
+            let def = &reg.endpoint.def;
+            let prefix = def.route_prefix.trim_end_matches('/');
+            let endpoint_url = format!("{}{}/api/v1/chat/completions", base_url, prefix);
+
+            serde_json::json!({
+                "id": name,
+                "display_name": def.description,
+                "endpoint": endpoint_url,
+                "model_archetype": def.archetype,
+                "model": name,
+                "x402_cost": def.cost.parse::<u64>().unwrap_or(0),
+                "credit_cost": def.credit_cost,
+                "max_input_tokens": def.max_input_tokens,
+                "max_output_tokens": def.max_output_tokens,
+            })
+        })
+        .collect();
+
+    entries.sort_by(|a, b| {
+        a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or(""))
+    });
+
+    HttpResponse::Ok().json(entries)
+}
+
 /// Health check
 async fn health_handler(
     settlement_queue: Option<web::Data<Arc<SettlementQueue>>>,
@@ -395,6 +433,7 @@ async fn main() -> std::io::Result<()> {
         app
             // Public endpoints
             .route("/", web::get().to(root_handler))
+            .route("/endpoints", web::get().to(endpoints_handler))
             .route("/health", web::get().to(health_handler))
             .route("/metrics", web::get().to(metrics_handler))
             .route("/credits/balance", web::get().to(credits_balance_handler))
