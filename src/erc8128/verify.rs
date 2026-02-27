@@ -145,8 +145,8 @@ fn ecrecover(hash: &[u8; 32], sig: &[u8; 65]) -> Result<String, Erc8128Error> {
     hasher.update(&pubkey_uncompressed[1..]);
     let hash = hasher.finalize();
 
-    let addr = format!("0x{}", hex::encode(&hash[12..]));
-    Ok(addr)
+    let addr_bytes: [u8; 20] = hash[12..].try_into().unwrap();
+    Ok(super::to_checksum_address(&addr_bytes))
 }
 
 /// Verify an ERC-8128 signed HTTP request from an actix-web `HttpRequest`.

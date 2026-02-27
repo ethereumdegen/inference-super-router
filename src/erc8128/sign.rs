@@ -34,7 +34,8 @@ impl Erc8128Signer {
         let mut hasher = Keccak256::new();
         hasher.update(&pubkey_uncompressed[1..]);
         let hash = hasher.finalize();
-        let address = format!("0x{}", hex::encode(&hash[12..]));
+        let addr_bytes: [u8; 20] = hash[12..].try_into().unwrap();
+        let address = super::to_checksum_address(&addr_bytes);
 
         Ok(Self {
             signing_key,
