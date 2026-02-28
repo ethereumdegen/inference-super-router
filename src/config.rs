@@ -12,6 +12,7 @@ pub struct GlobalConfig {
     pub facilitator_url: String,
     pub base_url: Option<String>,
     pub test_mode: bool,
+    pub x402_enabled: bool,
     pub endpoints_config_path: String,
 
     // USDC (x402 v2) settings
@@ -71,6 +72,10 @@ impl GlobalConfig {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
+        let x402_enabled = env::var("X402_ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true);
+
         let port = env::var("PORT")
             .unwrap_or_else(|_| "8080".to_string())
             .parse::<u16>()
@@ -121,6 +126,7 @@ impl GlobalConfig {
             facilitator_url,
             base_url,
             test_mode,
+            x402_enabled,
             endpoints_config_path,
             usdc_network,
             usdc_token_address,

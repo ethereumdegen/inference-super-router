@@ -10,8 +10,8 @@ use crate::endpoints::ResolvedEndpoint;
 use crate::erc8128;
 use crate::payment::EndpointPaymentConfig;
 use crate::services::{
-    CreditsClient, FacilitatorClient, InferenceClient, NonceTracker, RateLimiter, SettlementQueue,
-    VerificationCache,
+    CreditsClient, FacilitatorClient, InferenceClient, NonceTracker, RateLimiter, SessionManager,
+    SettlementQueue, VerificationCache,
 };
 use actix_web::{
     body::EitherBody,
@@ -64,6 +64,7 @@ pub struct UnifiedDispatchMiddleware {
     rate_limiter: Arc<RateLimiter>,
     verification_cache: Arc<VerificationCache>,
     credits_client: Option<Arc<CreditsClient>>,
+    session_manager: Arc<SessionManager>,
 }
 
 impl UnifiedDispatchMiddleware {
@@ -77,6 +78,7 @@ impl UnifiedDispatchMiddleware {
         rate_limiter: Arc<RateLimiter>,
         verification_cache: Arc<VerificationCache>,
         credits_client: Option<Arc<CreditsClient>>,
+        session_manager: Arc<SessionManager>,
     ) -> Self {
         Self {
             global_config,
@@ -87,6 +89,7 @@ impl UnifiedDispatchMiddleware {
             rate_limiter,
             verification_cache,
             credits_client,
+            session_manager,
         }
     }
 }
@@ -114,6 +117,7 @@ where
             rate_limiter: self.rate_limiter.clone(),
             verification_cache: self.verification_cache.clone(),
             credits_client: self.credits_client.clone(),
+            session_manager: self.session_manager.clone(),
         }))
     }
 }
@@ -128,6 +132,7 @@ pub struct UnifiedDispatchMiddlewareService<S> {
     rate_limiter: Arc<RateLimiter>,
     verification_cache: Arc<VerificationCache>,
     credits_client: Option<Arc<CreditsClient>>,
+    session_manager: Arc<SessionManager>,
 }
 
 impl<S, B> Service<ServiceRequest> for UnifiedDispatchMiddlewareService<S>
@@ -152,6 +157,7 @@ where
         let rate_limiter = self.rate_limiter.clone();
         let verification_cache = self.verification_cache.clone();
         let credits_client = self.credits_client.clone();
+        let session_manager = self.session_manager.clone();
 
         Box::pin(async move {
             let mut req = req;
@@ -203,6 +209,12 @@ where
             let pay_mode = match payment_type.as_deref() {
                 None | Some("") | Some("auto") => "auto",
                 Some("credits") => "credits",
+                Some("x402") if !global_config.x402_enabled => {
+                    let response = HttpResponse::BadRequest().json(serde_json::json!({
+                        "error": "x402 on-chain payment is currently disabled. Please use credits.",
+                    }));
+                    return Ok(req.into_response(response).map_into_right_body());
+                }
                 Some("x402") => "x402",
                 Some(other) => {
                     let response = HttpResponse::BadRequest().json(serde_json::json!({
@@ -224,6 +236,8 @@ where
             let credit_cost = registered.credit_cost;
             let credits_available = credit_cost > 0 && credits_client.is_some();
             let has_erc8128 = erc8128::has_erc8128_headers(req.headers());
+            let bearer_token = extract_bearer_token(req.headers());
+            let has_bearer = bearer_token.is_some();
 
             // If client explicitly requested credits but this endpoint doesn't support them
             if pay_mode == "credits" && !credits_available {
@@ -237,98 +251,128 @@ where
             }
 
             info!(
-                "[CREDITS] credit_cost={}, credits_client={}, has_erc8128_headers={}, model={}, pay_mode={}",
+                "[CREDITS] credit_cost={}, credits_client={}, has_erc8128={}, has_bearer={}, model={}, pay_mode={}",
                 credit_cost,
                 credits_client.is_some(),
                 has_erc8128,
+                has_bearer,
                 model_key,
                 pay_mode
             );
 
-            // Try credits path if applicable (auto+headers or explicit credits)
+            // Try credits path if applicable:
+            //   - Bearer token present (session-based) OR ERC-8128 headers present
+            //   - AND credits are available for this endpoint
+            //   - AND pay_mode is "credits" or "auto"
             let try_credits = credits_available
-                && (pay_mode == "credits" || (pay_mode == "auto" && has_erc8128));
+                && (pay_mode == "credits"
+                    || (pay_mode == "auto" && (has_bearer || has_erc8128)));
 
             if try_credits {
-                if pay_mode == "credits" && !has_erc8128 {
-                    // Client asked for credits but didn't send ERC-8128 headers
-                    let response = HttpResponse::BadRequest().json(serde_json::json!({
-                        "error": "payment_type \"credits\" requires ERC-8128 signed request headers (Signature-Input, Signature, Content-Digest).",
-                    }));
-                    return Ok(req.into_response(response).map_into_right_body());
-                }
-
-                info!("[CREDITS] Attempting ERC-8128 credits path (cost={})", credit_cost);
-                let cc = credits_client.as_ref().unwrap();
-
-                match erc8128::verify_from_request(req.request(), &body_bytes) {
-                    Ok(identity) => {
-                        let wallet = identity.wallet_address.to_lowercase();
-                        info!("[CREDITS] ERC-8128 verified for wallet: {} (chain: {})", wallet, identity.chain_id);
-
-                        match cc.get_credits(&wallet).await {
-                            Ok(credits) if credits >= credit_cost => {
-                                info!("[CREDITS] Wallet {} has {} credits, deducting {}", wallet, credits, credit_cost);
-                                match cc.adjust_credits(&wallet, -credit_cost).await {
-                                    Ok(new_balance) => {
-                                        info!(
-                                            "[CREDITS] SUCCESS: deducted {} credits from {}: {} remaining",
-                                            credit_cost, wallet, new_balance
-                                        );
-                                        set_payload_from_bytes(&mut req, body_bytes);
-                                        let res = service.call(req).await?;
-                                        return Ok(res.map_into_left_body());
-                                    }
-                                    Err(e) => {
-                                        warn!("[CREDITS] Failed to deduct credits for {}: {}", wallet, e);
-                                        if pay_mode == "credits" {
-                                            let response = HttpResponse::InternalServerError().json(serde_json::json!({
-                                                "error": format!("Credits deduction failed: {}", e),
-                                            }));
-                                            return Ok(req.into_response(response).map_into_right_body());
-                                        }
-                                        // auto: fall through to x402
-                                    }
-                                }
+                // Resolve wallet address: Bearer token (fast path) or ERC-8128 signature
+                let wallet_result = if let Some(ref token) = bearer_token {
+                    match session_manager.validate(token) {
+                        Some(info) => {
+                            info!("[CREDITS] Bearer session validated for wallet: {}", info.wallet_address);
+                            Ok(info.wallet_address)
+                        }
+                        None => {
+                            // Invalid/expired token
+                            if pay_mode == "credits" {
+                                let response = HttpResponse::Unauthorized().json(serde_json::json!({
+                                    "error": "Invalid or expired session token",
+                                }));
+                                return Ok(req.into_response(response).map_into_right_body());
                             }
-                            Ok(credits) => {
-                                if pay_mode == "credits" {
-                                    let response = HttpResponse::PaymentRequired().json(serde_json::json!({
-                                        "error": format!(
-                                            "Insufficient credits: have {}, need {} for model '{}'",
-                                            credits, credit_cost, model_key
-                                        ),
-                                    }));
-                                    return Ok(req.into_response(response).map_into_right_body());
-                                }
-                                info!(
-                                    "[CREDITS] Wallet {} has {} credits (need {}, insufficient), falling through to x402",
-                                    wallet, credits, credit_cost
-                                );
+                            Err("Invalid or expired session token".to_string())
+                        }
+                    }
+                } else if has_erc8128 {
+                    match erc8128::verify_from_request(req.request(), &body_bytes) {
+                        Ok(identity) => {
+                            let wallet = identity.wallet_address.to_lowercase();
+                            info!("[CREDITS] ERC-8128 verified for wallet: {} (chain: {})", wallet, identity.chain_id);
+                            Ok(wallet)
+                        }
+                        Err(e) => {
+                            warn!("[CREDITS] ERC-8128 verification failed: {}", e);
+                            if pay_mode == "credits" {
+                                let response = HttpResponse::Unauthorized().json(serde_json::json!({
+                                    "error": format!("ERC-8128 signature verification failed: {}", e),
+                                }));
+                                return Ok(req.into_response(response).map_into_right_body());
                             }
-                            Err(e) => {
-                                warn!("[CREDITS] Credits check failed for {}: {}", wallet, e);
-                                if pay_mode == "credits" {
-                                    let response = HttpResponse::InternalServerError().json(serde_json::json!({
-                                        "error": format!("Credits check failed: {}", e),
-                                    }));
-                                    return Ok(req.into_response(response).map_into_right_body());
+                            Err(e.to_string())
+                        }
+                    }
+                } else {
+                    // credits mode but no auth
+                    if pay_mode == "credits" {
+                        let response = HttpResponse::BadRequest().json(serde_json::json!({
+                            "error": "payment_type \"credits\" requires a Bearer session token or ERC-8128 signed headers.",
+                        }));
+                        return Ok(req.into_response(response).map_into_right_body());
+                    }
+                    Err("No credentials".to_string())
+                };
+
+                if let Ok(wallet) = wallet_result {
+                    info!("[CREDITS] Attempting credits deduction for {} (cost={})", wallet, credit_cost);
+                    let cc = credits_client.as_ref().unwrap();
+
+                    match cc.get_credits(&wallet).await {
+                        Ok(credits) if credits >= credit_cost => {
+                            info!("[CREDITS] Wallet {} has {} credits, deducting {}", wallet, credits, credit_cost);
+                            match cc.adjust_credits(&wallet, -credit_cost).await {
+                                Ok(new_balance) => {
+                                    info!(
+                                        "[CREDITS] SUCCESS: deducted {} credits from {}: {} remaining",
+                                        credit_cost, wallet, new_balance
+                                    );
+                                    set_payload_from_bytes(&mut req, body_bytes);
+                                    let res = service.call(req).await?;
+                                    return Ok(res.map_into_left_body());
+                                }
+                                Err(e) => {
+                                    warn!("[CREDITS] Failed to deduct credits for {}: {}", wallet, e);
+                                    if pay_mode == "credits" {
+                                        let response = HttpResponse::InternalServerError().json(serde_json::json!({
+                                            "error": format!("Credits deduction failed: {}", e),
+                                        }));
+                                        return Ok(req.into_response(response).map_into_right_body());
+                                    }
+                                    // auto: fall through to x402
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!("[CREDITS] ERC-8128 verification failed: {}", e);
-                        if pay_mode == "credits" {
-                            let response = HttpResponse::Unauthorized().json(serde_json::json!({
-                                "error": format!("ERC-8128 signature verification failed: {}", e),
-                            }));
-                            return Ok(req.into_response(response).map_into_right_body());
+                        Ok(credits) => {
+                            if pay_mode == "credits" {
+                                let response = HttpResponse::PaymentRequired().json(serde_json::json!({
+                                    "error": format!(
+                                        "Insufficient credits: have {}, need {} for model '{}'",
+                                        credits, credit_cost, model_key
+                                    ),
+                                }));
+                                return Ok(req.into_response(response).map_into_right_body());
+                            }
+                            info!(
+                                "[CREDITS] Wallet {} has {} credits (need {}, insufficient), falling through to x402",
+                                wallet, credits, credit_cost
+                            );
+                        }
+                        Err(e) => {
+                            warn!("[CREDITS] Credits check failed for {}: {}", wallet, e);
+                            if pay_mode == "credits" {
+                                let response = HttpResponse::InternalServerError().json(serde_json::json!({
+                                    "error": format!("Credits check failed: {}", e),
+                                }));
+                                return Ok(req.into_response(response).map_into_right_body());
+                            }
                         }
                     }
                 }
             } else if pay_mode == "auto" && credits_available {
-                info!("[CREDITS] No ERC-8128 headers in request, skipping credits path");
+                info!("[CREDITS] No auth headers in request, skipping credits path");
             }
 
             // If client explicitly requested credits, we would have returned above.
@@ -336,6 +380,14 @@ where
             if pay_mode == "credits" {
                 let response = HttpResponse::InternalServerError().json(serde_json::json!({
                     "error": "Credits payment failed unexpectedly.",
+                }));
+                return Ok(req.into_response(response).map_into_right_body());
+            }
+
+            // x402 disabled — reject requests that didn't pay via credits
+            if !global_config.x402_enabled {
+                let response = HttpResponse::PaymentRequired().json(serde_json::json!({
+                    "error": "x402 on-chain payment is currently disabled. Please use credits.",
                 }));
                 return Ok(req.into_response(response).map_into_right_body());
             }
@@ -388,4 +440,13 @@ fn set_payload_from_bytes(req: &mut ServiceRequest, body: Vec<u8>) {
     let (_, mut pl) = actix_http::h1::Payload::create(true);
     pl.unread_data(Bytes::from(body));
     req.set_payload(pl.into());
+}
+
+/// Extract a Bearer token from the Authorization header.
+fn extract_bearer_token(headers: &actix_web::http::header::HeaderMap) -> Option<String> {
+    headers
+        .get(actix_web::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
 }

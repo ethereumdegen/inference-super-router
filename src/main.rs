@@ -16,8 +16,8 @@ use endpoints::{load_endpoints, resolve_endpoint, ResolvedEndpoint};
 use middleware::{EndpointRegistry, RegisteredEndpoint, UnifiedDispatchMiddleware};
 use payment::EndpointPaymentConfig;
 use services::{
-    CreditsClient, FacilitatorClient, InferenceClient, NonceTracker, RateLimiter, SettlementQueue,
-    SettlementWorker, VerificationCache,
+    CreditsClient, FacilitatorClient, InferenceClient, NonceTracker, RateLimiter, SessionManager,
+    SettlementQueue, SettlementWorker, VerificationCache,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,11 +84,68 @@ async fn root_handler(
 
 /// Credits balance endpoint — returns the caller's credit balance.
 ///
-/// Requires ERC-8128 signed request headers. The wallet address is recovered
-/// from the signature (no query param needed).
+/// Accepts either a Bearer session token or ERC-8128 signed request headers.
 async fn credits_balance_handler(
     req: actix_web::HttpRequest,
     credits_client: Option<web::Data<Arc<CreditsClient>>>,
+    session_manager: web::Data<Arc<SessionManager>>,
+) -> HttpResponse {
+    let credits_client = match credits_client {
+        Some(c) => c,
+        None => {
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "Credits system not enabled"
+            }));
+        }
+    };
+
+    // Try Bearer token first, fall back to ERC-8128
+    let wallet = if let Some(token) = extract_bearer_token(req.headers()) {
+        match session_manager.validate(&token) {
+            Some(info) => info.wallet_address,
+            None => {
+                return HttpResponse::Unauthorized().json(serde_json::json!({
+                    "error": "Invalid or expired session token"
+                }));
+            }
+        }
+    } else {
+        match erc8128::verify_from_request(&req, &[]) {
+            Ok(id) => id.wallet_address,
+            Err(e) => {
+                warn!("Credits balance: auth failed: {}", e);
+                return HttpResponse::Unauthorized().json(serde_json::json!({
+                    "error": format!("Bearer token or ERC-8128 signature required: {}", e)
+                }));
+            }
+        }
+    };
+
+    match credits_client.get_credits(&wallet).await {
+        Ok(balance) => {
+            HttpResponse::Ok().json(serde_json::json!({
+                "credits": balance,
+                "address": wallet
+            }))
+        }
+        Err(e) => {
+            error!("Credits balance lookup failed for {}: {}", wallet, e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to fetch credit balance"
+            }))
+        }
+    }
+}
+
+/// Create a credits session — exchange one ERC-8128 signature for a Bearer token.
+///
+/// The client signs this single request with ERC-8128 headers, and receives
+/// an opaque session token valid for ~1 hour, usable as `Authorization: Bearer <token>`.
+async fn credits_session_handler(
+    req: actix_web::HttpRequest,
+    body: web::Bytes,
+    credits_client: Option<web::Data<Arc<CreditsClient>>>,
+    session_manager: web::Data<Arc<SessionManager>>,
 ) -> HttpResponse {
     let credits_client = match credits_client {
         Some(c) => c,
@@ -100,30 +157,61 @@ async fn credits_balance_handler(
     };
 
     // Verify ERC-8128 signature to recover wallet address
-    let identity = match erc8128::verify_from_request(&req, &[]) {
+    let identity = match erc8128::verify_from_request(&req, &body) {
         Ok(id) => id,
         Err(e) => {
-            warn!("Credits balance: ERC-8128 verification failed: {}", e);
+            warn!("Credits session: ERC-8128 verification failed: {}", e);
             return HttpResponse::Unauthorized().json(serde_json::json!({
                 "error": format!("ERC-8128 signature required: {}", e)
             }));
         }
     };
 
-    match credits_client.get_credits(&identity.wallet_address).await {
-        Ok(balance) => {
-            HttpResponse::Ok().json(serde_json::json!({
-                "credits": balance,
-                "address": identity.wallet_address
-            }))
+    let wallet = identity.wallet_address.to_lowercase();
+
+    // Sanity check: wallet has credits
+    match credits_client.get_credits(&wallet).await {
+        Ok(credits) if credits > 0 => {
+            info!(
+                "[SESSION] Creating session for wallet {} (credits: {})",
+                wallet, credits
+            );
+        }
+        Ok(credits) => {
+            return HttpResponse::PaymentRequired().json(serde_json::json!({
+                "error": format!("No credits available (balance: {})", credits),
+                "credits": credits,
+                "address": wallet
+            }));
         }
         Err(e) => {
-            error!("Credits balance lookup failed for {}: {}", identity.wallet_address, e);
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": "Failed to fetch credit balance"
-            }))
+            error!("Credits check failed for session creation: {}", e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to check credit balance"
+            }));
         }
     }
+
+    let (token, expires_at) = session_manager.create_session(&wallet, identity.chain_id);
+    info!(
+        "[SESSION] Session created for wallet {} (expires_at: {}, ttl: {}s)",
+        wallet, expires_at, session_manager.ttl_secs()
+    );
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "session_token": token,
+        "expires_at": expires_at,
+        "wallet": wallet
+    }))
+}
+
+/// Extract a Bearer token from the Authorization header.
+fn extract_bearer_token(headers: &actix_web::http::header::HeaderMap) -> Option<String> {
+    headers
+        .get(actix_web::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
 }
 
 /// Public endpoint catalog — returns JSON array of all available models with pricing.
@@ -333,6 +421,8 @@ async fn main() -> std::io::Result<()> {
     let nonce_tracker = Arc::new(NonceTracker::with_default_ttl());
     let rate_limiter = Arc::new(RateLimiter::new(5));
     let verification_cache = Arc::new(VerificationCache::with_default_ttl());
+    let session_manager = Arc::new(SessionManager::from_env());
+    info!("Session manager initialized (TTL: {}s)", session_manager.ttl_secs());
 
     let max_queue_size = std::env::var("SETTLEMENT_QUEUE_MAX_SIZE")
         .ok()
@@ -369,6 +459,7 @@ async fn main() -> std::io::Result<()> {
     let worker_metrics_for_app = worker_metrics.clone();
     let verification_cache_for_app = verification_cache.clone();
     let credits_client_for_app = credits_client.clone();
+    let session_manager_for_app = session_manager.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
     let registry_for_app = registry.clone();
 
@@ -401,6 +492,7 @@ async fn main() -> std::io::Result<()> {
                 rate_limiter.clone(),
                 verification_cache.clone(),
                 credits_client_for_app.clone(),
+                session_manager_for_app.clone(),
             ))
             .route("", web::post().to(handler::unified_chat_handler));
 
@@ -414,6 +506,7 @@ async fn main() -> std::io::Result<()> {
                 rate_limiter.clone(),
                 verification_cache.clone(),
                 credits_client_for_app.clone(),
+                session_manager_for_app.clone(),
             ))
             .route("/completions", web::post().to(handler::unified_chat_handler));
 
@@ -423,7 +516,8 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::from(registry_for_app.clone()))
             .app_data(web::Data::new(settlement_queue_for_app.clone()))
             .app_data(web::Data::new(worker_metrics_for_app.clone()))
-            .app_data(web::Data::new(verification_cache_for_app.clone()));
+            .app_data(web::Data::new(verification_cache_for_app.clone()))
+            .app_data(web::Data::new(session_manager_for_app.clone()));
 
         // Conditionally register credits_client as app_data (for balance endpoint)
         if let Some(ref cc) = credits_client_for_app {
@@ -437,6 +531,7 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(health_handler))
             .route("/metrics", web::get().to(metrics_handler))
             .route("/credits/balance", web::get().to(credits_balance_handler))
+            .route("/credits/session", web::post().to(credits_session_handler))
             .service(Files::new("/.well-known", "public/.well-known"))
             .service(chat_scope)
             .service(api_scope)
