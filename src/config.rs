@@ -74,7 +74,7 @@ impl GlobalConfig {
 
         let x402_enabled = env::var("X402_ENABLED")
             .map(|v| v == "true" || v == "1")
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         let port = env::var("PORT")
             .unwrap_or_else(|_| "8080".to_string())

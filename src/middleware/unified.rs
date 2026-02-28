@@ -385,9 +385,10 @@ where
             }
 
             // x402 disabled — reject requests that didn't pay via credits
+            // Return 503 (not 402) to avoid triggering the client's x402 payment flow
             if !global_config.x402_enabled {
-                let response = HttpResponse::PaymentRequired().json(serde_json::json!({
-                    "error": "x402 on-chain payment is currently disabled. Please use credits.",
+                let response = HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "error": "Payment required but x402 on-chain payment is disabled. Please use credits (Bearer token or ERC-8128 headers).",
                 }));
                 return Ok(req.into_response(response).map_into_right_body());
             }
