@@ -228,8 +228,9 @@ async fn endpoints_handler(
         .iter()
         .map(|(name, reg)| {
             let def = &reg.endpoint.def;
-            let prefix = def.route_prefix.trim_end_matches('/');
-            let endpoint_url = format!("{}{}/api/v1/chat/completions", base_url, prefix);
+            // All models are dispatched via the unified /api/v1/chat/completions
+            // route using the JSON "model" field — route_prefix is not used for routing.
+            let endpoint_url = format!("{}/api/v1/chat/completions", base_url);
 
             serde_json::json!({
                 "id": name,
