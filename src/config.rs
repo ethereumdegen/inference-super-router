@@ -1,6 +1,5 @@
 use std::env;
 
-use crate::erc8128::Erc8128Signer;
 use crate::models::DomainEthAddress;
 
 /// Global configuration from environment variables.
@@ -32,35 +31,23 @@ pub struct GlobalConfig {
 /// Credits system configuration (optional, loaded from env).
 #[derive(Clone)]
 pub struct CreditsConfig {
-    pub signer: Erc8128Signer,
+    pub secret_key: String,
     pub api_url: String,
 }
 
 impl CreditsConfig {
-    /// Load from environment. Returns `None` if `CREDITS_ADMIN_PRIVATE_KEY` is not set.
+    /// Load from environment. Returns `None` if `CREDITS_ADMIN_SECRET_KEY` is not set.
     pub fn from_env() -> Option<Self> {
-        let private_key = env::var("CREDITS_ADMIN_PRIVATE_KEY").ok()?;
-        if private_key.is_empty() {
+        let secret_key = env::var("CREDITS_ADMIN_SECRET_KEY").ok()?;
+        if secret_key.is_empty() {
             return None;
         }
 
         let api_url = env::var("CREDITS_API_URL")
             .unwrap_or_else(|_| "https://starkbot.cloud/api".to_string());
 
-        let chain_id: u64 = env::var("CREDITS_CHAIN_ID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8453); // Base mainnet
-
-        let signer = match Erc8128Signer::from_private_key(&private_key, chain_id) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Failed to create ERC-8128 signer from CREDITS_ADMIN_PRIVATE_KEY: {}", e);
-                return None;
-            }
-        };
-
-        Some(Self { signer, api_url })
+        tracing::info!("Credits system enabled (API: {})", api_url);
+        Some(Self { secret_key, api_url })
     }
 }
 

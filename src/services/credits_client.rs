@@ -1,8 +1,8 @@
 //! HTTP client for the starkbot.cloud credits API.
 //!
-//! All requests to the credits API are signed with an admin ERC-8128 key.
+//! All requests to the credits API are authenticated with a shared secret key
+//! sent as `Authorization: Bearer <secret>`.
 
-use crate::erc8128::Erc8128Signer;
 use reqwest::Client;
 use tracing::{debug, error};
 
@@ -11,15 +11,15 @@ use tracing::{debug, error};
 pub struct CreditsClient {
     http: Client,
     base_url: String,
-    signer: Erc8128Signer,
+    secret_key: String,
 }
 
 impl CreditsClient {
-    pub fn new(base_url: &str, signer: Erc8128Signer) -> Self {
+    pub fn new(base_url: &str, secret_key: String) -> Self {
         Self {
             http: Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            signer,
+            secret_key,
         }
     }
 
@@ -30,28 +30,12 @@ impl CreditsClient {
         let query = format!("address={}", wallet_address);
         let url = format!("{}{}?{}", self.base_url, route, query);
 
-        // Sign with the full path as seen by the server (path_prefix + route)
-        let authority = extract_authority(&self.base_url);
-        let signing_path = format!("{}{}", extract_path_prefix(&self.base_url), route);
+        debug!("[CREDITS_CLIENT] get_credits: url={}", url);
 
-        debug!(
-            "[CREDITS_CLIENT] get_credits: url={}, authority={}, signing_path={}, signer_addr={}",
-            url, authority, signing_path, self.signer.address()
-        );
-
-        let signed = self
-            .signer
-            .sign_request("GET", &authority, &signing_path, Some(&query), None)
-            .map_err(|e| format!("Failed to sign credits request: {}", e))?;
-
-        let mut req = self.http.get(&url);
-        req = req.header("signature-input", &signed.signature_input);
-        req = req.header("signature", &signed.signature);
-        if let Some(ref digest) = signed.content_digest {
-            req = req.header("content-digest", digest);
-        }
-
-        let resp = req
+        let resp = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.secret_key))
             .send()
             .await
             .map_err(|e| format!("Credits API request failed: {}", e))?;
@@ -63,21 +47,24 @@ impl CreditsClient {
             .map_err(|e| format!("Failed to read credits response: {}", e))?;
 
         if !status.is_success() {
-            error!("[CREDITS_CLIENT] get_credits failed: status={}, body={}, url={}", status, body, url);
+            error!(
+                "[CREDITS_CLIENT] get_credits failed: status={}, body={}, url={}",
+                status, body, url
+            );
             return Err(format!("Credits API error {}: {}", status, body));
         }
 
         debug!("[CREDITS_CLIENT] get_credits response: {}", body);
 
-        // Parse response: expect {"credits": N} or just a number
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| {
-                error!(
-                    "[CREDITS_CLIENT] Invalid JSON from credits API: error={}, url={}, body_preview={}",
-                    e, url, &body[..body.len().min(200)]
-                );
-                format!("Invalid credits JSON: {}", e)
-            })?;
+        let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            error!(
+                "[CREDITS_CLIENT] Invalid JSON from credits API: error={}, url={}, body_preview={}",
+                e,
+                url,
+                &body[..body.len().min(200)]
+            );
+            format!("Invalid credits JSON: {}", e)
+        })?;
 
         let credits = json
             .get("credits")
@@ -102,36 +89,18 @@ impl CreditsClient {
             "address": wallet_address,
             "delta": delta,
         });
-        let body_bytes = serde_json::to_vec(&body_json)
-            .map_err(|e| format!("Failed to serialize credits body: {}", e))?;
-
-        // Sign with the full path as seen by the server (path_prefix + route)
-        let authority = extract_authority(&self.base_url);
-        let signing_path = format!("{}{}", extract_path_prefix(&self.base_url), route);
 
         debug!(
-            "[CREDITS_CLIENT] adjust_credits: url={}, authority={}, signing_path={}, wallet={}, delta={}",
-            url, authority, signing_path, wallet_address, delta
+            "[CREDITS_CLIENT] adjust_credits: url={}, wallet={}, delta={}",
+            url, wallet_address, delta
         );
 
-        let signed = self
-            .signer
-            .sign_request("POST", &authority, &signing_path, None, Some(&body_bytes))
-            .map_err(|e| format!("Failed to sign credits request: {}", e))?;
-
-        let mut req = self
+        let resp = self
             .http
             .post(&url)
             .header("content-type", "application/json")
-            .header("signature-input", &signed.signature_input)
-            .header("signature", &signed.signature);
-
-        if let Some(ref digest) = signed.content_digest {
-            req = req.header("content-digest", digest);
-        }
-
-        let resp = req
-            .body(body_bytes)
+            .header("authorization", format!("Bearer {}", self.secret_key))
+            .json(&body_json)
             .send()
             .await
             .map_err(|e| format!("Credits API request failed: {}", e))?;
@@ -143,7 +112,10 @@ impl CreditsClient {
             .map_err(|e| format!("Failed to read credits response: {}", e))?;
 
         if !status.is_success() {
-            error!("[CREDITS_CLIENT] adjust_credits failed: status={}, body={}, url={}", status, resp_body, url);
+            error!(
+                "[CREDITS_CLIENT] adjust_credits failed: status={}, body={}, url={}",
+                status, resp_body, url
+            );
             return Err(format!("Credits API error {}: {}", status, resp_body));
         }
 
@@ -160,31 +132,5 @@ impl CreditsClient {
             wallet_address, delta, new_balance
         );
         Ok(new_balance)
-    }
-}
-
-/// Extract authority (host:port or host) from a URL string.
-fn extract_authority(url: &str) -> String {
-    url.strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-/// Extract the path prefix from a base URL.
-/// e.g. "https://starkbot.cloud/api" → "/api"
-/// e.g. "https://starkbot.cloud" → ""
-fn extract_path_prefix(url: &str) -> String {
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-
-    match without_scheme.find('/') {
-        Some(idx) => without_scheme[idx..].trim_end_matches('/').to_string(),
-        None => String::new(),
     }
 }

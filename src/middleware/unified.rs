@@ -306,13 +306,6 @@ where
                         }
                     }
                 } else {
-                    // credits mode but no auth
-                    if pay_mode == "credits" {
-                        let response = HttpResponse::BadRequest().json(serde_json::json!({
-                            "error": "payment_type \"credits\" requires a Bearer session token or ERC-8128 signed headers.",
-                        }));
-                        return Ok(req.into_response(response).map_into_right_body());
-                    }
                     Err("No credentials".to_string())
                 };
 

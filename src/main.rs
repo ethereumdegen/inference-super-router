@@ -338,15 +338,11 @@ async fn main() -> std::io::Result<()> {
     // Initialize credits system (optional)
     let credits_client: Option<Arc<CreditsClient>> = match CreditsConfig::from_env() {
         Some(cfg) => {
-            info!(
-                "Credits system enabled (admin address: {})",
-                cfg.signer.address()
-            );
-            let client = CreditsClient::new(&cfg.api_url, cfg.signer);
+            let client = CreditsClient::new(&cfg.api_url, cfg.secret_key);
             Some(Arc::new(client))
         }
         None => {
-            info!("Credits system disabled (CREDITS_ADMIN_PRIVATE_KEY not set)");
+            info!("Credits system disabled (CREDITS_ADMIN_SECRET_KEY not set)");
             None
         }
     };
