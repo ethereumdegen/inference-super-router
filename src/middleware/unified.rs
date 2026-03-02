@@ -277,14 +277,11 @@ where
                             Ok(info.wallet_address)
                         }
                         None => {
-                            // Invalid/expired token
-                            if pay_mode == "credits" {
-                                let response = HttpResponse::Unauthorized().json(serde_json::json!({
-                                    "error": "Invalid or expired session token",
-                                }));
-                                return Ok(req.into_response(response).map_into_right_body());
-                            }
-                            Err("Invalid or expired session token".to_string())
+                            // Invalid/expired token — always return 401 so clients know to refresh
+                            let response = HttpResponse::Unauthorized().json(serde_json::json!({
+                                "error": "Invalid or expired session token",
+                            }));
+                            return Ok(req.into_response(response).map_into_right_body());
                         }
                     }
                 } else if has_erc8128 {
@@ -306,6 +303,13 @@ where
                         }
                     }
                 } else {
+                    // No auth headers present
+                    if pay_mode == "credits" {
+                        let response = HttpResponse::Unauthorized().json(serde_json::json!({
+                            "error": "payment_type \"credits\" requires a Bearer session token or ERC-8128 signed headers.",
+                        }));
+                        return Ok(req.into_response(response).map_into_right_body());
+                    }
                     Err("No credentials".to_string())
                 };
 
@@ -368,11 +372,13 @@ where
                 info!("[CREDITS] No auth headers in request, skipping credits path");
             }
 
-            // If client explicitly requested credits, we would have returned above.
-            // If we're here with pay_mode == "credits", something unexpected happened.
+            // All pay_mode == "credits" paths return above (success, 401, 402, or 500).
+            // This should be unreachable, but guard against it with a clear error.
             if pay_mode == "credits" {
+                warn!("[CREDITS] Unexpected fall-through for pay_mode=credits (bearer={}, erc8128={}, credits_available={})",
+                    has_bearer, has_erc8128, credits_available);
                 let response = HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": "Credits payment failed unexpectedly.",
+                    "error": "Credits payment failed unexpectedly. Please retry or use payment_type \"auto\".",
                 }));
                 return Ok(req.into_response(response).map_into_right_body());
             }
